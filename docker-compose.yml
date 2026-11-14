@@ -1,0 +1,43 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: subnetpulse-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - sqlite_data:/app/data
+    environment:
+      - DATABASE_URL=sqlite:////app/data/subnetpulse.db
+      - PING_CONCURRENCY=128
+      - PING_TIMEOUT_SECONDS=1.5
+      - SCHEDULER_TICK_SECONDS=15
+      - CORS_ORIGINS=*
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    networks:
+      - subnetpulse_net
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: subnetpulse-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    networks:
+      - subnetpulse_net
+
+volumes:
+  sqlite_data:
+    driver: local
+
+networks:
+  subnetpulse_net:
+    driver: bridge
