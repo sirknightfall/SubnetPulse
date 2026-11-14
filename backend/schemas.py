@@ -3,7 +3,7 @@ import re
 from datetime import datetime
 from typing import List, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
 
 from models import AuditFlag, IPStatus, ScanStatus
 
@@ -69,8 +69,8 @@ class SubnetBase(BaseModel):
     label: str = Field(..., min_length=1, max_length=160, examples=["Birmingham Office - Server VLAN"])
     vlan_id: Optional[int] = Field(None, ge=1, le=4094)
     gateway_ip: Optional[str] = None
-    scan_enabled: bool = True
-    scan_interval_minutes: int = Field(default=60, ge=1, le=10080)
+    scan_enabled: bool = False
+    scan_interval_hours: int = Field(default=24, ge=1, le=720)
     scan_cron_time: Optional[str] = Field(
         default=None, description="Optional daily HH:MM schedule in 24h format"
     )
@@ -111,7 +111,7 @@ class SubnetUpdate(BaseModel):
     vlan_id: Optional[int] = Field(None, ge=1, le=4094)
     gateway_ip: Optional[str] = None
     scan_enabled: Optional[bool] = None
-    scan_interval_minutes: Optional[int] = Field(None, ge=1, le=10080)
+    scan_interval_hours: Optional[int] = Field(None, ge=1, le=720)
     scan_cron_time: Optional[str] = None
 
 
@@ -135,6 +135,11 @@ class SubnetSummaryRead(BaseModel):
     offline_count: int
     unknown_count: int
     suspected_unused_count: int
+
+    @computed_field
+    @property
+    def scan_interval_hours(self) -> int:
+        return max(1, round(self.scan_interval_minutes / 60))
 
     @property
     def utilization_percent(self) -> float:
@@ -172,8 +177,8 @@ class BulkSubnetImportItem(BaseModel):
     label: str = Field(..., min_length=1, max_length=160)
     vlan_id: Optional[int] = Field(None, ge=1, le=4094)
     gateway_ip: Optional[str] = None
-    scan_enabled: bool = True
-    scan_interval_minutes: int = Field(default=60, ge=1, le=10080)
+    scan_enabled: bool = False
+    scan_interval_hours: int = Field(default=24, ge=1, le=720)
     scan_cron_time: Optional[str] = None
 
     @field_validator("cidr")

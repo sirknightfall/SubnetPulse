@@ -357,16 +357,8 @@ class SubnetScannerWorker:
             db.query(IPRecord)
             .filter(
                 IPRecord.subnet_id == subnet.id,
-                or_(
-                    IPRecord.audit_flag.in_(
-                        [
-                            AuditFlag.SUSPECTED_UNUSED,
-                            AuditFlag.GHOST_DEVICE,
-                            AuditFlag.EXPECTED_DECOMMISSIONED,
-                        ]
-                    ),
-                    (IPRecord.ipam_allocated.is_(True) & (IPRecord.status != IPStatus.ONLINE)),
-                ),
+                IPRecord.first_seen_online_at.is_(None),
+                IPRecord.status == IPStatus.OFFLINE,
             )
             .count()
         )

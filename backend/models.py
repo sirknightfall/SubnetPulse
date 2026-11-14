@@ -86,8 +86,8 @@ class SubnetScope(Base):
     gateway_ip: Mapped[Optional[str]] = mapped_column(String(45), nullable=True)
 
     # Scheduling & Automated Sweep Configuration
-    scan_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    scan_interval_minutes: Mapped[int] = mapped_column(Integer, default=60, nullable=False)
+    scan_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    scan_interval_minutes: Mapped[int] = mapped_column(Integer, default=1440, nullable=False)
     scan_cron_time: Mapped[Optional[str]] = mapped_column(
         String(16), nullable=True, doc="Optional HH:MM daily execution time in UTC"
     )

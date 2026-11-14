@@ -108,8 +108,8 @@ def seed_initial_corporate_data(db: Session) -> None:
             label="Birmingham Office - Server VLAN",
             vlan_id=20,
             gateway_ip="10.50.20.1",
-            scan_enabled=True,
-            scan_interval_minutes=30,
+            scan_enabled=False,
+            scan_interval_minutes=24 * 60,
             scan_cron_time="02:00",
         ),
         SubnetScope(
@@ -118,8 +118,8 @@ def seed_initial_corporate_data(db: Session) -> None:
             label="Birmingham Office - Corporate Printers & IoT",
             vlan_id=30,
             gateway_ip="10.50.30.1",
-            scan_enabled=True,
-            scan_interval_minutes=60,
+            scan_enabled=False,
+            scan_interval_minutes=24 * 60,
         ),
         SubnetScope(
             site_id=london.id,
@@ -127,8 +127,8 @@ def seed_initial_corporate_data(db: Session) -> None:
             label="London DC - Core Infrastructure Management",
             vlan_id=100,
             gateway_ip="172.16.100.1",
-            scan_enabled=True,
-            scan_interval_minutes=15,
+            scan_enabled=False,
+            scan_interval_minutes=12 * 60,
             scan_cron_time="04:30",
         ),
         SubnetScope(
@@ -137,8 +137,8 @@ def seed_initial_corporate_data(db: Session) -> None:
             label="Manchester Branch - Legacy Workstation Scope",
             vlan_id=88,
             gateway_ip="192.168.88.1",
-            scan_enabled=True,
-            scan_interval_minutes=120,
+            scan_enabled=False,
+            scan_interval_minutes=24 * 60,
         ),
     ]
 
@@ -219,11 +219,7 @@ def seed_initial_corporate_data(db: Session) -> None:
                 rec.consecutive_offline_scans = 1
                 offline_c += 1
 
-            if rec.audit_flag in (
-                AuditFlag.SUSPECTED_UNUSED,
-                AuditFlag.GHOST_DEVICE,
-                AuditFlag.EXPECTED_DECOMMISSIONED,
-            ) or (rec.ipam_allocated and rec.status != IPStatus.ONLINE):
+            if rec.first_seen_online_at is None and rec.status == IPStatus.OFFLINE:
                 unused_c += 1
 
         primary_subnet.online_count = online_c
@@ -378,7 +374,7 @@ async def create_subnet(
         vlan_id=payload.vlan_id,
         gateway_ip=payload.gateway_ip.strip() if payload.gateway_ip else None,
         scan_enabled=payload.scan_enabled,
-        scan_interval_minutes=payload.scan_interval_minutes,
+        scan_interval_minutes=payload.scan_interval_hours * 60,
         scan_cron_time=payload.scan_cron_time,
         scan_status=ScanStatus.IDLE,
     )
@@ -402,6 +398,10 @@ def update_subnet(
         raise HTTPException(status_code=404, detail="Subnet not found.")
 
     update_data = payload.model_dump(exclude_unset=True)
+    if "scan_interval_hours" in update_data:
+        hours_val = update_data.pop("scan_interval_hours")
+        if hours_val is not None:
+            subnet.scan_interval_minutes = int(hours_val) * 60
     for field, value in update_data.items():
         setattr(subnet, field, value)
 
@@ -473,17 +473,7 @@ def clear_subnet_history(subnet_id: int, db: Session = Depends(get_db)):
     subnet.last_scan_duration_ms = None
     subnet.scan_status = ScanStatus.IDLE
 
-    unused_cnt = sum(
-        1
-        for rec in ip_records
-        if rec.audit_flag
-        in (
-            AuditFlag.SUSPECTED_UNUSED,
-            AuditFlag.GHOST_DEVICE,
-            AuditFlag.EXPECTED_DECOMMISSIONED,
-        )
-    )
-    subnet.suspected_unused_count = unused_cnt
+    subnet.suspected_unused_count = 0
     db.commit()
     db.refresh(subnet)
     return subnet
@@ -524,7 +514,7 @@ def _execute_bulk_import(
             vlan_id=item.vlan_id,
             gateway_ip=item.gateway_ip.strip() if item.gateway_ip else None,
             scan_enabled=item.scan_enabled,
-            scan_interval_minutes=item.scan_interval_minutes,
+            scan_interval_minutes=item.scan_interval_hours * 60,
             scan_cron_time=item.scan_cron_time,
             scan_status=ScanStatus.IDLE,
         )
@@ -568,7 +558,7 @@ async def bulk_import_subnets_csv(
 ):
     """
     Bulk-imports subnets from an uploaded CSV file with columns:
-    site_name,cidr,label,vlan_id,gateway_ip,scan_interval_minutes,scan_cron_time
+    site_name,cidr,label,vlan_id,gateway_ip,scan_interval_hours,scan_cron_time
     """
     raw_bytes = await file.read()
     try:
@@ -584,7 +574,8 @@ async def bulk_import_subnets_csv(
             if not row or not (row.get("cidr") and row.get("site_name")):
                 continue
             vlan_raw = (row.get("vlan_id") or "").strip()
-            interval_raw = (row.get("scan_interval_minutes") or "60").strip()
+            interval_raw = (row.get("scan_interval_hours") or "24").strip()
+            scan_enabled_raw = str(row.get("scan_enabled", "false")).strip().lower()
             items.append(
                 BulkSubnetImportItem(
                     site_name=row["site_name"].strip(),
@@ -592,8 +583,8 @@ async def bulk_import_subnets_csv(
                     label=(row.get("label") or row["cidr"]).strip(),
                     vlan_id=int(vlan_raw) if vlan_raw.isdigit() else None,
                     gateway_ip=(row.get("gateway_ip") or "").strip() or None,
-                    scan_enabled=str(row.get("scan_enabled", "true")).lower() not in ("false", "0", "no"),
-                    scan_interval_minutes=int(interval_raw) if interval_raw.isdigit() else 60,
+                    scan_enabled=scan_enabled_raw in ("true", "1", "yes"),
+                    scan_interval_hours=int(interval_raw) if interval_raw.isdigit() else 24,
                     scan_cron_time=(row.get("scan_cron_time") or "").strip() or None,
                 )
             )
@@ -702,23 +693,15 @@ def update_ip_record_audit(
 
     db.commit()
 
-    # Recompute suspected_unused_count on parent subnet
+    # Recompute suspected_unused_count on parent subnet (hosts that have never responded to ping)
     subnet = db.query(SubnetScope).filter(SubnetScope.id == ip_record.subnet_id).first()
     if subnet:
         unused_cnt = (
             db.query(IPRecord)
             .filter(
                 IPRecord.subnet_id == subnet.id,
-                or_(
-                    IPRecord.audit_flag.in_(
-                        [
-                            AuditFlag.SUSPECTED_UNUSED,
-                            AuditFlag.GHOST_DEVICE,
-                            AuditFlag.EXPECTED_DECOMMISSIONED,
-                        ]
-                    ),
-                    (IPRecord.ipam_allocated.is_(True) & (IPRecord.status != IPStatus.ONLINE)),
-                ),
+                IPRecord.first_seen_online_at.is_(None),
+                IPRecord.status == IPStatus.OFFLINE,
             )
             .count()
         )
@@ -750,10 +733,18 @@ def _compile_unused_and_orphaned_ips(
     site_id: Optional[int] = None,
     subnet_id: Optional[int] = None,
 ) -> List[OrphanedOrUnusedIPReportItem]:
+    """
+    Returns only IP records that have NEVER responded to a ping
+    (first_seen_online_at is None and status != Online), scoped to the requested subnet.
+    """
     query = (
         db.query(IPRecord, SubnetScope, Site)
         .join(SubnetScope, IPRecord.subnet_id == SubnetScope.id)
         .join(Site, SubnetScope.site_id == Site.id)
+        .filter(
+            IPRecord.first_seen_online_at.is_(None),
+            IPRecord.status != IPStatus.ONLINE,
+        )
     )
 
     if site_id is not None:
@@ -765,53 +756,31 @@ def _compile_unused_and_orphaned_ips(
     report_items: List[OrphanedOrUnusedIPReportItem] = []
 
     for ip_rec, subnet, site in rows:
-        reasons: List[str] = []
+        if ip_rec.consecutive_offline_scans > 0:
+            reason = f"Never responded to ping ({ip_rec.consecutive_offline_scans} sweep(s) completed)"
+        else:
+            reason = "Never responded to ping (awaiting initial sweep)"
 
-        if ip_rec.audit_flag == AuditFlag.SUSPECTED_UNUSED:
-            reasons.append("Flagged as Suspected Unused")
-        elif ip_rec.audit_flag == AuditFlag.GHOST_DEVICE:
-            reasons.append("Flagged as Ghost Device (unexpected active host)")
-        elif ip_rec.audit_flag == AuditFlag.EXPECTED_DECOMMISSIONED and ip_rec.status == IPStatus.ONLINE:
-            reasons.append("Expected Decommissioned host still responding to ping")
-        elif ip_rec.audit_flag == AuditFlag.EXPECTED_DECOMMISSIONED:
-            reasons.append("Marked Expected Decommissioned (ready for IPAM reclamation)")
-
-        if ip_rec.ipam_allocated and ip_rec.status == IPStatus.OFFLINE:
-            reasons.append(
-                f"Allocated in IPAM ({ip_rec.ipam_owner or 'Unassigned'}) but Offline ({ip_rec.consecutive_offline_scans} consecutive sweeps)"
+        report_items.append(
+            OrphanedOrUnusedIPReportItem(
+                ip_id=ip_rec.id,
+                ip_address=ip_rec.ip_address,
+                hostname=ip_rec.hostname,
+                status=ip_rec.status,
+                subnet_id=subnet.id,
+                subnet_cidr=subnet.cidr,
+                subnet_label=subnet.label,
+                site_name=site.name,
+                first_seen_online_at=ip_rec.first_seen_online_at,
+                last_seen_online_at=ip_rec.last_seen_online_at,
+                consecutive_offline_scans=ip_rec.consecutive_offline_scans,
+                ipam_allocated=ip_rec.ipam_allocated,
+                ipam_owner=ip_rec.ipam_owner,
+                audit_flag=ip_rec.audit_flag,
+                audit_notes=ip_rec.audit_notes,
+                classification_reason=reason,
             )
-        elif not ip_rec.ipam_allocated and ip_rec.status == IPStatus.ONLINE:
-            reasons.append("Orphaned Active IP: Responding to ping but unallocated in IPAM")
-        elif (
-            ip_rec.first_seen_online_at is not None
-            and ip_rec.status == IPStatus.OFFLINE
-            and ip_rec.consecutive_offline_scans >= 2
-        ):
-            reasons.append(
-                f"Previously online host now stale/offline for {ip_rec.consecutive_offline_scans} sweeps"
-            )
-
-        if reasons:
-            report_items.append(
-                OrphanedOrUnusedIPReportItem(
-                    ip_id=ip_rec.id,
-                    ip_address=ip_rec.ip_address,
-                    hostname=ip_rec.hostname,
-                    status=ip_rec.status,
-                    subnet_id=subnet.id,
-                    subnet_cidr=subnet.cidr,
-                    subnet_label=subnet.label,
-                    site_name=site.name,
-                    first_seen_online_at=ip_rec.first_seen_online_at,
-                    last_seen_online_at=ip_rec.last_seen_online_at,
-                    consecutive_offline_scans=ip_rec.consecutive_offline_scans,
-                    ipam_allocated=ip_rec.ipam_allocated,
-                    ipam_owner=ip_rec.ipam_owner,
-                    audit_flag=ip_rec.audit_flag,
-                    audit_notes=ip_rec.audit_notes,
-                    classification_reason=" | ".join(reasons),
-                )
-            )
+        )
 
     return report_items
 

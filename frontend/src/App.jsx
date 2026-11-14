@@ -46,8 +46,8 @@ const SAMPLE_BULK_JSON = JSON.stringify(
       label: "Birmingham - Security & Badge Controllers",
       vlan_id: 40,
       gateway_ip: "10.50.40.1",
-      scan_enabled: true,
-      scan_interval_minutes: 30,
+      scan_enabled: false,
+      scan_interval_hours: 24,
       scan_cron_time: "03:15"
     },
     {
@@ -56,8 +56,8 @@ const SAMPLE_BULK_JSON = JSON.stringify(
       label: "Bristol R&D Hardware Testbench",
       vlan_id: 210,
       gateway_ip: "172.22.10.1",
-      scan_enabled: true,
-      scan_interval_minutes: 45,
+      scan_enabled: false,
+      scan_interval_hours: 12,
       scan_cron_time: null
     }
   ],
@@ -147,6 +147,8 @@ export default function App() {
   const [historyModalIp, setHistoryModalIp] = useState(null);
   const [editingIpRecord, setEditingIpRecord] = useState(null);
   const [showBulkModal, setShowBulkModal] = useState(false);
+  const [bulkModalInitialTab, setBulkModalInitialTab] = useState("json");
+  const [bulkModalInitialSite, setBulkModalInitialSite] = useState("");
   const [showScheduleModal, setShowScheduleModal] = useState(false);
 
   // Unused / Orphaned Report State
@@ -230,10 +232,14 @@ export default function App() {
   }, [selectedSubnetId, statusFilter, flagFilter, ipSearchQuery, showToast]);
 
   const loadUnusedReport = useCallback(async () => {
+    if (!selectedSubnetId) {
+      setReportItems([]);
+      return;
+    }
     try {
       setReportLoading(true);
       const data = await api.getUnusedIpReport({
-        site_id: reportSiteFilter || undefined
+        subnet_id: selectedSubnetId
       });
       setReportItems(data);
     } catch (err) {
@@ -241,7 +247,7 @@ export default function App() {
     } finally {
       setReportLoading(false);
     }
-  }, [reportSiteFilter, showToast]);
+  }, [selectedSubnetId, showToast]);
 
   useEffect(() => {
     loadTree();
@@ -503,21 +509,25 @@ export default function App() {
               }`}
             >
               <ShieldAlert className="w-3.5 h-3.5" />
-              Unused &amp; Ghost Report
-              {globalSummary.totalSuspectedUnused > 0 && (
+              Unused Report
+              {selectedSubnetContext && (
                 <span className="px-1.5 py-0.2 rounded-full text-[10px] font-mono bg-slate-950/30">
-                  {globalSummary.totalSuspectedUnused}
+                  {selectedSubnetContext.subnet.suspected_unused_count}
                 </span>
               )}
             </button>
           </div>
 
           <button
-            onClick={() => setShowBulkModal(true)}
+            onClick={() => {
+              setBulkModalInitialTab("json");
+              setBulkModalInitialSite("");
+              setShowBulkModal(true);
+            }}
             className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-100 border border-slate-700 transition flex items-center gap-1.5"
           >
             <Upload className="w-3.5 h-3.5 text-sky-400" />
-            Add / Bulk Import
+            Bulk Import
           </button>
         </div>
       </header>
@@ -545,8 +555,8 @@ export default function App() {
       <div className="flex-1 flex min-h-0">
         {/* LEFT PANE: Persistent Subnet Navigation Tree */}
         <aside className="w-80 xl:w-96 shrink-0 border-r border-slate-800 bg-slate-900/50 flex flex-col">
-          <div className="p-3 border-b border-slate-800">
-            <div className="relative">
+          <div className="p-3 border-b border-slate-800 flex items-center gap-2">
+            <div className="relative flex-1">
               <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
               <input
                 type="text"
@@ -556,6 +566,21 @@ export default function App() {
                 className="w-full pl-8 pr-3 py-1.5 text-xs bg-slate-950 border border-slate-800 rounded-lg text-slate-100 placeholder-slate-500 focus:outline-none focus:border-sky-500"
               />
             </div>
+            <button
+              type="button"
+              onClick={() => {
+                setBulkModalInitialTab("single");
+                setBulkModalInitialSite(
+                  selectedSubnetContext?.site?.name || tree[0]?.name || ""
+                );
+                setShowBulkModal(true);
+              }}
+              title="Quick add a single subnet"
+              className="px-2.5 py-1.5 rounded-lg bg-sky-500 hover:bg-sky-400 text-slate-950 font-semibold text-xs flex items-center gap-1 shrink-0 transition shadow-sm"
+            >
+              <Plus className="w-4 h-4 stroke-[2.5]" />
+              <span>Subnet</span>
+            </button>
           </div>
 
           <div className="flex-1 overflow-y-auto p-2.5 space-y-2">
@@ -591,10 +616,23 @@ export default function App() {
                           {site.name}
                         </span>
                       </div>
-                      <div className="flex items-center gap-1.5">
-                        <span className="text-[11px] font-mono text-slate-400">
+                      <div className="flex items-center gap-1">
+                        <span className="text-[11px] font-mono text-slate-400 mr-0.5">
                           {site.subnets.length}
                         </span>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setBulkModalInitialTab("single");
+                            setBulkModalInitialSite(site.name);
+                            setShowBulkModal(true);
+                          }}
+                          title={`Add subnet to ${site.name}`}
+                          className="p-1 rounded hover:bg-sky-500/20 text-slate-400 hover:text-sky-300 transition"
+                        >
+                          <Plus className="w-3.5 h-3.5" />
+                        </button>
                         <button
                           type="button"
                           onClick={(e) => handleDeleteSite(site, e)}
@@ -609,9 +647,7 @@ export default function App() {
                     {isExpanded && (
                       <div className="divide-y divide-slate-800/60 border-t border-slate-800/80">
                         {site.subnets.map((subnet) => {
-                          const isSelected =
-                            selectedSubnetId === subnet.id &&
-                            activeView === "inventory";
+                          const isSelected = selectedSubnetId === subnet.id;
                           const onlinePct =
                             subnet.total_hosts > 0
                               ? Math.round(
@@ -635,7 +671,6 @@ export default function App() {
                               key={subnet.id}
                               onClick={() => {
                                 setSelectedSubnetId(subnet.id);
-                                setActiveView("inventory");
                               }}
                               className={`p-3 cursor-pointer transition group/subnet ${
                                 isSelected
@@ -662,8 +697,8 @@ export default function App() {
                                     }
                                     title={
                                       subnet.scan_enabled
-                                        ? `Periodic scan ON (every ${subnet.scan_interval_minutes}m) — click to disable`
-                                        : "Periodic scan OFF — click to enable"
+                                        ? `Periodic scan ON (every ${subnet.scan_interval_hours}h) — click to disable`
+                                        : `Periodic scan OFF (every ${subnet.scan_interval_hours}h) — click to enable`
                                     }
                                     className={`px-1.5 py-0.5 rounded text-[10px] font-mono font-medium border transition ${
                                       subnet.scan_enabled
@@ -733,7 +768,7 @@ export default function App() {
                                 <span>{subnet.offline_count} offline</span>
                                 {subnet.suspected_unused_count > 0 && (
                                   <span className="text-amber-400">
-                                    {subnet.suspected_unused_count} flagged
+                                    {subnet.suspected_unused_count} unused
                                   </span>
                                 )}
                               </div>
@@ -751,19 +786,14 @@ export default function App() {
 
         {/* RIGHT PANE: Main Content Area */}
         <main className="flex-1 flex flex-col min-w-0 bg-slate-950">
-          {activeView === "report" ? (
+          {activeView === "report" && selectedSubnetContext ? (
             <UnusedIpReportPanel
-              sites={tree}
+              subnetContext={selectedSubnetContext}
               reportItems={reportItems}
               loading={reportLoading}
-              siteFilter={reportSiteFilter}
-              onSiteFilterChange={setReportSiteFilter}
               onRefresh={loadUnusedReport}
               onSelectIpHistory={openHistoryModal}
-              onJumpToSubnet={(subnetId) => {
-                setSelectedSubnetId(subnetId);
-                setActiveView("inventory");
-              }}
+              onSwitchToInventory={() => setActiveView("inventory")}
             />
           ) : selectedSubnetContext ? (
             <>
@@ -803,7 +833,9 @@ export default function App() {
                     >
                       <Clock className="w-3.5 h-3.5 text-sky-400" />
                       <span>
-                        Every {selectedSubnetContext.subnet.scan_interval_minutes}m
+                        {selectedSubnetContext.subnet.scan_enabled
+                          ? `Auto: Every ${selectedSubnetContext.subnet.scan_interval_hours}h`
+                          : `Auto: Off (${selectedSubnetContext.subnet.scan_interval_hours}h)`}
                         {selectedSubnetContext.subnet.scan_cron_time
                           ? ` • Cron ${selectedSubnetContext.subnet.scan_cron_time} UTC`
                           : ""}
@@ -1116,6 +1148,8 @@ export default function App() {
       {showBulkModal && (
         <BulkImportModal
           sites={tree}
+          initialTab={bulkModalInitialTab}
+          initialSiteName={bulkModalInitialSite}
           onClose={() => setShowBulkModal(false)}
           onImported={(msg) => {
             setShowBulkModal(false);
@@ -1142,46 +1176,47 @@ export default function App() {
 }
 
 /* ============================================================================
- * Dedicated Suspected Unused & Orphaned IP Report View
+ * Dedicated Unused IP Report View (Per Scan Range — Never Responded to Ping)
  * ============================================================================ */
 function UnusedIpReportPanel({
-  sites,
+  subnetContext,
   reportItems,
   loading,
-  siteFilter,
-  onSiteFilterChange,
   onRefresh,
   onSelectIpHistory,
-  onJumpToSubnet
+  onSwitchToInventory
 }) {
+  const { site, subnet } = subnetContext;
+
   return (
     <div className="flex-1 flex flex-col min-h-0">
       <div className="p-4 border-b border-slate-800 bg-slate-900/40 flex flex-wrap items-center justify-between gap-3">
         <div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2.5">
             <ShieldAlert className="w-5 h-5 text-amber-400" />
-            <h1 className="text-base font-bold text-white">
-              Suspected Unused, Stale IPAM &amp; Ghost Device Audit Report
+            <h1 className="text-base font-bold font-mono text-white">
+              {subnet.cidr} — Unused IP Report
             </h1>
+            <span className="text-xs px-2 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700">
+              {site.name}
+            </span>
+            <span className="text-xs font-mono px-2 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30">
+              {reportItems.length} Never Responded
+            </span>
           </div>
           <p className="text-xs text-slate-400 mt-0.5">
-            Cross-subnet reconciliation identifying IPAM-allocated hosts offline across multiple sweeps, rogue active IPs, and decommissioned ghosts.
+            {subnet.label} — Showing only IP addresses in this scan range that have never responded to a ping.
           </p>
         </div>
 
         <div className="flex items-center gap-2">
-          <select
-            value={siteFilter}
-            onChange={(e) => onSiteFilterChange(e.target.value)}
-            className="px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-800 text-xs text-slate-200"
+          <button
+            onClick={onSwitchToInventory}
+            className="px-3 py-1.5 rounded-lg text-xs bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-800 flex items-center gap-1.5"
           >
-            <option value="">All Corporate Sites</option>
-            {sites.map((s) => (
-              <option key={s.id} value={s.id}>
-                {s.name}
-              </option>
-            ))}
-          </select>
+            <Server className="w-3.5 h-3.5 text-sky-400" />
+            Full Subnet Inventory
+          </button>
 
           <button
             onClick={onRefresh}
@@ -1193,7 +1228,7 @@ function UnusedIpReportPanel({
 
           <a
             href={api.getUnusedIpExportUrl("csv", {
-              site_id: siteFilter || undefined
+              subnet_id: subnet.id
             })}
             className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-500 hover:bg-emerald-400 text-slate-950 flex items-center gap-1.5 transition"
           >
@@ -1203,7 +1238,7 @@ function UnusedIpReportPanel({
 
           <a
             href={api.getUnusedIpExportUrl("json", {
-              site_id: siteFilter || undefined
+              subnet_id: subnet.id
             })}
             className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-sky-500 hover:bg-sky-400 text-slate-950 flex items-center gap-1.5 transition"
           >
@@ -1217,11 +1252,11 @@ function UnusedIpReportPanel({
         <table className="w-full text-left border-collapse">
           <thead className="sticky top-0 bg-slate-900/95 border-b border-slate-800 text-[11px] font-semibold uppercase tracking-wider text-slate-400">
             <tr>
-              <th className="py-2.5 px-4">Site &amp; Subnet</th>
-              <th className="py-2.5 px-3">IP &amp; Hostname</th>
-              <th className="py-2.5 px-3">Status</th>
+              <th className="py-2.5 px-4">IP Address &amp; Hostname</th>
+              <th className="py-2.5 px-3">Current Status</th>
+              <th className="py-2.5 px-3">First / Last Seen Online</th>
               <th className="py-2.5 px-3">Audit Flag</th>
-              <th className="py-2.5 px-3">Reconciliation Finding</th>
+              <th className="py-2.5 px-3">Unused Status</th>
               <th className="py-2.5 px-4 text-right">Actions</th>
             </tr>
           </thead>
@@ -1229,39 +1264,31 @@ function UnusedIpReportPanel({
             {loading ? (
               <tr>
                 <td colSpan={6} className="py-12 text-center text-slate-400">
-                  Compiling cross-subnet audit report...
+                  Loading unused IP addresses for {subnet.cidr}...
                 </td>
               </tr>
             ) : reportItems.length === 0 ? (
               <tr>
                 <td colSpan={6} className="py-12 text-center text-slate-500">
-                  No unused or discrepant IP records detected across the selected scope.
+                  Every IP in {subnet.cidr} has responded to a ping at least once.
                 </td>
               </tr>
             ) : (
               reportItems.map((item) => (
                 <tr key={item.ip_id} className="hover:bg-slate-900/60">
                   <td className="py-2.5 px-4">
-                    <div className="font-semibold text-slate-200">
-                      {item.site_name}
-                    </div>
-                    <button
-                      onClick={() => onJumpToSubnet(item.subnet_id)}
-                      className="font-mono text-[11px] text-sky-400 hover:underline"
-                    >
-                      {item.subnet_cidr} ({item.subnet_label})
-                    </button>
-                  </td>
-                  <td className="py-2.5 px-3">
                     <div className="font-mono font-semibold text-white">
                       {item.ip_address}
                     </div>
                     <div className="text-[11px] text-slate-400">
-                      {item.hostname || "No PTR hostname"}
+                      {item.hostname || "—"}
                     </div>
                   </td>
                   <td className="py-2.5 px-3">
                     <StatusBadge status={item.status} />
+                  </td>
+                  <td className="py-2.5 px-3 font-mono text-[11px] text-slate-400">
+                    Never seen online
                   </td>
                   <td className="py-2.5 px-3">
                     <AuditFlagBadge flag={item.audit_flag} />
@@ -1513,8 +1540,13 @@ function EditIpAuditModal({ ipRecord, onClose, onSaved }) {
 /* ============================================================================
  * Modal: Bulk Subnet Import (JSON / CSV / Single Form)
  * ============================================================================ */
-function BulkImportModal({ onClose, onImported }) {
-  const [tab, setTab] = useState("json"); // "json" | "csv" | "single"
+function BulkImportModal({
+  initialTab = "json",
+  initialSiteName = "",
+  onClose,
+  onImported
+}) {
+  const [tab, setTab] = useState(initialTab); // "json" | "csv" | "single"
   const [jsonText, setJsonText] = useState(SAMPLE_BULK_JSON);
   const [csvFile, setCsvFile] = useState(null);
   const [triggerScan, setTriggerScan] = useState(true);
@@ -1522,11 +1554,14 @@ function BulkImportModal({ onClose, onImported }) {
   const [submitting, setSubmitting] = useState(false);
 
   // Single Subnet Quick Form State
-  const [siteName, setSiteName] = useState("Birmingham Office");
+  const [siteName, setSiteName] = useState(
+    initialSiteName || "Birmingham Office"
+  );
   const [cidr, setCidr] = useState("127.0.0.0/29");
   const [label, setLabel] = useState("Localhost Loopback Verification Scope");
   const [vlanId, setVlanId] = useState("99");
-  const [intervalMinutes, setIntervalMinutes] = useState("30");
+  const [intervalHours, setIntervalHours] = useState("24");
+  const [repeatScanEnabled, setRepeatScanEnabled] = useState(false);
 
   const handleImportSubmit = async (e) => {
     e.preventDefault();
@@ -1560,8 +1595,8 @@ function BulkImportModal({ onClose, onImported }) {
               cidr,
               label,
               vlan_id: vlanId ? Number(vlanId) : null,
-              scan_enabled: true,
-              scan_interval_minutes: Number(intervalMinutes) || 60
+              scan_enabled: repeatScanEnabled,
+              scan_interval_hours: Number(intervalHours) || 24
             }
           ],
           trigger_initial_scan: triggerScan
@@ -1657,7 +1692,7 @@ function BulkImportModal({ onClose, onImported }) {
               <p className="text-slate-400">
                 Upload a CSV file with headers:{" "}
                 <code className="text-sky-300 font-mono">
-                  site_name,cidr,label,vlan_id,gateway_ip,scan_interval_minutes,scan_cron_time
+                  site_name,cidr,label,vlan_id,gateway_ip,scan_interval_hours,scan_cron_time
                 </code>
               </p>
               <input
@@ -1716,15 +1751,27 @@ function BulkImportModal({ onClose, onImported }) {
               </div>
               <div>
                 <label className="block text-slate-400 mb-1">
-                  Sweep Interval (Minutes)
+                  Repeat Scan Interval (Hours)
                 </label>
                 <input
                   type="number"
                   min={1}
-                  value={intervalMinutes}
-                  onChange={(e) => setIntervalMinutes(e.target.value)}
+                  max={720}
+                  value={intervalHours}
+                  onChange={(e) => setIntervalHours(e.target.value)}
                   className="w-full px-3 py-1.5 font-mono rounded-lg bg-slate-950 border border-slate-800 text-slate-100"
                 />
+              </div>
+              <div className="flex items-end pb-1.5">
+                <label className="flex items-center gap-2 text-slate-300 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={repeatScanEnabled}
+                    onChange={(e) => setRepeatScanEnabled(e.target.checked)}
+                    className="w-4 h-4 accent-sky-500"
+                  />
+                  <span>Enable Repeat Scan</span>
+                </label>
               </div>
             </div>
           )}
@@ -1766,8 +1813,8 @@ function BulkImportModal({ onClose, onImported }) {
  * ============================================================================ */
 function SubnetScheduleModal({ subnet, onClose, onSaved }) {
   const [scanEnabled, setScanEnabled] = useState(subnet.scan_enabled);
-  const [intervalMinutes, setIntervalMinutes] = useState(
-    subnet.scan_interval_minutes
+  const [intervalHours, setIntervalHours] = useState(
+    subnet.scan_interval_hours || 24
   );
   const [cronTime, setCronTime] = useState(subnet.scan_cron_time || "");
   const [saving, setSaving] = useState(false);
@@ -1778,7 +1825,7 @@ function SubnetScheduleModal({ subnet, onClose, onSaved }) {
     try {
       await api.updateSubnet(subnet.id, {
         scan_enabled: scanEnabled,
-        scan_interval_minutes: Number(intervalMinutes) || 60,
+        scan_interval_hours: Number(intervalHours) || 24,
         scan_cron_time: cronTime.trim() || null
       });
       onSaved();
@@ -1809,7 +1856,7 @@ function SubnetScheduleModal({ subnet, onClose, onSaved }) {
         <div className="p-5 space-y-3 text-xs">
           <label className="flex items-center justify-between">
             <span className="text-slate-300 font-medium">
-              Enable Automated Background Sweeps
+              Enable Automated Repeat Scans
             </span>
             <input
               type="checkbox"
@@ -1821,14 +1868,14 @@ function SubnetScheduleModal({ subnet, onClose, onSaved }) {
 
           <div>
             <label className="block text-slate-400 mb-1">
-              Recurring Interval (Minutes)
+              Repeat Scan Interval (Hours)
             </label>
             <input
               type="number"
               min={1}
-              max={10080}
-              value={intervalMinutes}
-              onChange={(e) => setIntervalMinutes(e.target.value)}
+              max={720}
+              value={intervalHours}
+              onChange={(e) => setIntervalHours(e.target.value)}
               className="w-full px-3 py-1.5 font-mono rounded-lg bg-slate-950 border border-slate-800 text-slate-100"
             />
           </div>
