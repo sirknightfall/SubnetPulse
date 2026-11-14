@@ -42,7 +42,6 @@ const SAMPLE_BULK_JSON = JSON.stringify(
   [
     {
       site_name: "Birmingham Office",
-      site_code: "BHX-HQ",
       cidr: "10.50.40.0/29",
       label: "Birmingham - Security & Badge Controllers",
       vlan_id: 40,
@@ -53,7 +52,6 @@ const SAMPLE_BULK_JSON = JSON.stringify(
     },
     {
       site_name: "Bristol Lab",
-      site_code: "BRS-RND",
       cidr: "172.22.10.0/29",
       label: "Bristol R&D Hardware Testbench",
       vlan_id: 210,
@@ -328,6 +326,43 @@ export default function App() {
     }
   };
 
+  const handleToggleSubnetPeriodicScan = async (subnet, e) => {
+    if (e) e.stopPropagation();
+    const nextEnabled = !subnet.scan_enabled;
+    try {
+      await api.updateSubnet(subnet.id, { scan_enabled: nextEnabled });
+      showToast(
+        `Periodic scan ${nextEnabled ? "enabled" : "disabled"} for ${subnet.cidr}.`,
+        "success"
+      );
+      await loadTree();
+    } catch (err) {
+      showToast(err.message, "error");
+    }
+  };
+
+  const handleClearSubnetHistory = async (subnet, e) => {
+    if (e) e.stopPropagation();
+    const confirmed = window.confirm(
+      `Clear all audit event logs and reset scan history for ${subnet.cidr} (${subnet.label})?`
+    );
+    if (!confirmed) return;
+
+    try {
+      await api.clearSubnetHistory(subnet.id);
+      showToast(`Cleared scan & audit history for ${subnet.cidr}.`, "info");
+      await loadTree();
+      if (selectedSubnetId === subnet.id) {
+        loadSubnetIps();
+      }
+      if (activeView === "report") {
+        loadUnusedReport();
+      }
+    } catch (err) {
+      showToast(err.message, "error");
+    }
+  };
+
   const handleQuickFlagChange = async (ipRec, newFlag) => {
     try {
       await api.updateIpRecord(ipRec.id, { audit_flag: newFlag });
@@ -368,9 +403,7 @@ export default function App() {
     const q = sidebarSearch.toLowerCase();
     return tree
       .map((site) => {
-        const siteMatches =
-          site.name.toLowerCase().includes(q) ||
-          (site.code && site.code.toLowerCase().includes(q));
+        const siteMatches = site.name.toLowerCase().includes(q);
         const matchingSubnets = site.subnets.filter(
           (s) =>
             siteMatches ||
@@ -557,11 +590,6 @@ export default function App() {
                         <span className="text-xs font-semibold text-slate-200 truncate">
                           {site.name}
                         </span>
-                        {site.code && (
-                          <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-slate-800 text-slate-400 border border-slate-700">
-                            {site.code}
-                          </span>
-                        )}
                       </div>
                       <div className="flex items-center gap-1.5">
                         <span className="text-[11px] font-mono text-slate-400">
@@ -626,17 +654,37 @@ export default function App() {
                                     </span>
                                   )}
                                 </div>
-                                <div className="flex items-center gap-1.5">
-                                  {subnet.scan_status === "Scanning" ? (
-                                    <span className="inline-flex items-center gap-1 text-[10px] font-medium text-sky-400">
-                                      <RefreshCw className="w-3 h-3 animate-spin" />
-                                      Sweeping
-                                    </span>
-                                  ) : (
-                                    <span className="font-mono text-[11px] text-slate-400">
-                                      {onlinePct}% used
-                                    </span>
-                                  )}
+                                <div className="flex items-center gap-1">
+                                  <button
+                                    type="button"
+                                    onClick={(e) =>
+                                      handleToggleSubnetPeriodicScan(subnet, e)
+                                    }
+                                    title={
+                                      subnet.scan_enabled
+                                        ? `Periodic scan ON (every ${subnet.scan_interval_minutes}m) — click to disable`
+                                        : "Periodic scan OFF — click to enable"
+                                    }
+                                    className={`px-1.5 py-0.5 rounded text-[10px] font-mono font-medium border transition ${
+                                      subnet.scan_enabled
+                                        ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/30 hover:bg-emerald-500/25"
+                                        : "bg-slate-800 text-slate-400 border-slate-700 hover:text-slate-200"
+                                    }`}
+                                  >
+                                    {subnet.scan_enabled ? "Auto: ON" : "Auto: OFF"}
+                                  </button>
+
+                                  <button
+                                    type="button"
+                                    onClick={(e) =>
+                                      handleClearSubnetHistory(subnet, e)
+                                    }
+                                    title={`Clear history for ${subnet.cidr}`}
+                                    className="opacity-0 group-hover/subnet:opacity-100 p-1 rounded hover:bg-amber-500/20 text-slate-400 hover:text-amber-300 transition"
+                                  >
+                                    <History className="w-3 h-3" />
+                                  </button>
+
                                   <button
                                     type="button"
                                     onClick={(e) => handleDeleteSubnet(subnet, e)}
@@ -648,9 +696,21 @@ export default function App() {
                                 </div>
                               </div>
 
-                              <p className="text-xs text-slate-300 truncate mt-0.5">
-                                {subnet.label}
-                              </p>
+                              <div className="flex items-center justify-between gap-2 mt-0.5">
+                                <p className="text-xs text-slate-300 truncate">
+                                  {subnet.label}
+                                </p>
+                                {subnet.scan_status === "Scanning" ? (
+                                  <span className="inline-flex items-center gap-1 text-[10px] font-medium text-sky-400 shrink-0">
+                                    <RefreshCw className="w-3 h-3 animate-spin" />
+                                    Sweeping
+                                  </span>
+                                ) : (
+                                  <span className="font-mono text-[11px] text-slate-400 shrink-0">
+                                    {onlinePct}% used
+                                  </span>
+                                )}
+                              </div>
 
                               {/* Visual Utilization Progress Bar: Online vs Suspected Unused */}
                               <div className="mt-2 h-1.5 w-full rounded-full bg-slate-800 overflow-hidden flex">
@@ -748,6 +808,20 @@ export default function App() {
                           ? ` • Cron ${selectedSubnetContext.subnet.scan_cron_time} UTC`
                           : ""}
                       </span>
+                    </button>
+
+                    <button
+                      onClick={(e) =>
+                        handleClearSubnetHistory(
+                          selectedSubnetContext.subnet,
+                          e
+                        )
+                      }
+                      className="px-3 py-1.5 rounded-lg text-xs font-medium bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 border border-amber-500/30 transition flex items-center gap-1.5"
+                      title="Clear all state transition logs and reset scan history for this subnet"
+                    >
+                      <History className="w-3.5 h-3.5" />
+                      Clear History
                     </button>
 
                     <button
@@ -1449,7 +1523,6 @@ function BulkImportModal({ onClose, onImported }) {
 
   // Single Subnet Quick Form State
   const [siteName, setSiteName] = useState("Birmingham Office");
-  const [siteCode, setSiteCode] = useState("BHX-HQ");
   const [cidr, setCidr] = useState("127.0.0.0/29");
   const [label, setLabel] = useState("Localhost Loopback Verification Scope");
   const [vlanId, setVlanId] = useState("99");
@@ -1484,7 +1557,6 @@ function BulkImportModal({ onClose, onImported }) {
           subnets: [
             {
               site_name: siteName,
-              site_code: siteCode || null,
               cidr,
               label,
               vlan_id: vlanId ? Number(vlanId) : null,
@@ -1585,7 +1657,7 @@ function BulkImportModal({ onClose, onImported }) {
               <p className="text-slate-400">
                 Upload a CSV file with headers:{" "}
                 <code className="text-sky-300 font-mono">
-                  site_name,site_code,cidr,label,vlan_id,gateway_ip,scan_interval_minutes,scan_cron_time
+                  site_name,cidr,label,vlan_id,gateway_ip,scan_interval_minutes,scan_cron_time
                 </code>
               </p>
               <input
@@ -1599,22 +1671,13 @@ function BulkImportModal({ onClose, onImported }) {
 
           {tab === "single" && (
             <div className="grid grid-cols-2 gap-3">
-              <div>
+              <div className="col-span-2">
                 <label className="block text-slate-400 mb-1">Site Name</label>
                 <input
                   type="text"
                   required
                   value={siteName}
                   onChange={(e) => setSiteName(e.target.value)}
-                  className="w-full px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-slate-100"
-                />
-              </div>
-              <div>
-                <label className="block text-slate-400 mb-1">Site Code</label>
-                <input
-                  type="text"
-                  value={siteCode}
-                  onChange={(e) => setSiteCode(e.target.value)}
                   className="w-full px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-slate-100"
                 />
               </div>
