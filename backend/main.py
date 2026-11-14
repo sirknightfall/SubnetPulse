@@ -7,30 +7,195 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from sqlalchemy import or_
+from sqlalchemy import or_, text
 from sqlalchemy.orm import Session, joinedload
 
+from auth import (
+    AUTH_TOKEN_TTL_SECONDS,
+    SESSION_COOKIE_NAME,
+    AuthPrincipal,
+    authenticate_credentials,
+    create_access_token,
+    get_optional_principal,
+    require_admin,
+    require_authenticated,
+)
 from database import Base, SessionLocal, engine, get_db
-from models import AuditEventLog, AuditFlag, IPRecord, IPStatus, ScanStatus, Site, SubnetScope
+from models import (
+    AuditEventLog,
+    AuditFlag,
+    IPRecord,
+    IPStatus,
+    ScanStatus,
+    Site,
+    SubnetScope,
+    compute_cidr_bounds,
+)
 from scanner import scanner_worker
 from schemas import (
     AuditEventLogRead,
+    AuthTokenResponse,
+    AuthUserRead,
     BulkSubnetImportItem,
     BulkSubnetImportRequest,
     BulkSubnetImportResult,
     IPRecordDetailRead,
     IPRecordRead,
     IPRecordUpdate,
+    LoginRequest,
     OrphanedOrUnusedIPReportItem,
     SiteCreate,
     SiteTreeRead,
     SubnetCreate,
     SubnetSummaryRead,
     SubnetUpdate,
+    cidrs_overlap,
 )
+
+
+def ensure_schema_compatibility() -> None:
+    """
+    Ensures existing SQLite databases created by earlier versions of SubnetPulse
+    are migrated in-place (adding network bound columns on `subnets` and relaxing
+    `NOT NULL` on `audit_event_logs.new_status`).
+    """
+    Base.metadata.create_all(bind=engine)
+    if not str(engine.url).startswith("sqlite"):
+        return
+
+    with engine.begin() as conn:
+        subnet_cols = {
+            row[1]: row for row in conn.execute(text("PRAGMA table_info(subnets)")).fetchall()
+        }
+        if subnet_cols:
+            if "network_start_int" not in subnet_cols:
+                conn.execute(
+                    text("ALTER TABLE subnets ADD COLUMN network_start_int INTEGER NOT NULL DEFAULT 0")
+                )
+            if "broadcast_end_int" not in subnet_cols:
+                conn.execute(
+                    text("ALTER TABLE subnets ADD COLUMN broadcast_end_int INTEGER NOT NULL DEFAULT 0")
+                )
+
+            rows = conn.execute(text("SELECT id, cidr FROM subnets")).fetchall()
+            for row_id, cidr_val in rows:
+                norm_cidr, start_int, end_int = compute_cidr_bounds(cidr_val)
+                conn.execute(
+                    text(
+                        "UPDATE subnets SET cidr = :c, network_start_int = :s, broadcast_end_int = :e "
+                        "WHERE id = :id"
+                    ),
+                    {"c": norm_cidr, "s": start_int, "e": end_int, "id": row_id},
+                )
+
+        audit_cols = {
+            row[1]: row for row in conn.execute(text("PRAGMA table_info(audit_event_logs)")).fetchall()
+        }
+        if "new_status" in audit_cols and audit_cols["new_status"][3] == 1:
+            # SQLite column `notnull` is 1; rebuild table with nullable `new_status`
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE audit_event_logs_new (
+                        id INTEGER NOT NULL PRIMARY KEY,
+                        ip_record_id INTEGER NOT NULL REFERENCES ip_records (id) ON DELETE CASCADE,
+                        previous_status VARCHAR(7),
+                        new_status VARCHAR(7),
+                        event_type VARCHAR(64) NOT NULL,
+                        response_time_ms FLOAT,
+                        details TEXT,
+                        timestamp DATETIME NOT NULL
+                    )
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO audit_event_logs_new (
+                        id, ip_record_id, previous_status, new_status,
+                        event_type, response_time_ms, details, timestamp
+                    )
+                    SELECT
+                        id,
+                        ip_record_id,
+                        CASE WHEN event_type = 'MANUAL_AUDIT_UPDATE' THEN NULL ELSE previous_status END,
+                        CASE WHEN event_type = 'MANUAL_AUDIT_UPDATE' THEN NULL ELSE new_status END,
+                        event_type,
+                        CASE WHEN event_type = 'MANUAL_AUDIT_UPDATE' THEN NULL ELSE response_time_ms END,
+                        details,
+                        timestamp
+                    FROM audit_event_logs
+                    """
+                )
+            )
+            conn.execute(text("DROP TABLE audit_event_logs"))
+            conn.execute(text("ALTER TABLE audit_event_logs_new RENAME TO audit_event_logs"))
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_audit_event_logs_id ON audit_event_logs (id)"
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_audit_event_logs_ip_record_id "
+                    "ON audit_event_logs (ip_record_id)"
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_audit_event_logs_timestamp "
+                    "ON audit_event_logs (timestamp)"
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_audit_logs_ip_timestamp "
+                    "ON audit_event_logs (ip_record_id, timestamp)"
+                )
+            )
+        elif "new_status" in audit_cols:
+            conn.execute(
+                text(
+                    "UPDATE audit_event_logs "
+                    "SET previous_status = NULL, new_status = NULL, response_time_ms = NULL "
+                    "WHERE event_type = 'MANUAL_AUDIT_UPDATE' AND previous_status = new_status"
+                )
+            )
+
+
+def find_overlapping_subnet(
+    db: Session,
+    cidr: str,
+    exclude_subnet_id: Optional[int] = None,
+) -> Optional[SubnetScope]:
+    """
+    Checks whether `cidr` is identical to or overlaps with any registered SubnetScope.
+    Uses both integer boundary comparison and `ipaddress.ip_network.overlaps`.
+    """
+    normalized_cidr, start_int, end_int = compute_cidr_bounds(cidr)
+    candidate_net = ipaddress.ip_network(normalized_cidr, strict=False)
+
+    query = db.query(SubnetScope)
+    if exclude_subnet_id is not None:
+        query = query.filter(SubnetScope.id != exclude_subnet_id)
+
+    bound_match = query.filter(
+        SubnetScope.network_start_int <= end_int,
+        SubnetScope.broadcast_end_int >= start_int,
+    ).first()
+    if bound_match is not None:
+        return bound_match
+
+    for existing in query.all():
+        existing_net = ipaddress.ip_network(existing.cidr, strict=False)
+        if candidate_net.overlaps(existing_net):
+            return existing
+
+    return None
 
 
 def populate_subnet_ip_records(db: Session, subnet: SubnetScope) -> int:
@@ -234,7 +399,7 @@ def seed_initial_corporate_data(db: Session) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    Base.metadata.create_all(bind=engine)
+    ensure_schema_compatibility()
     with SessionLocal() as db:
         seed_initial_corporate_data(db)
     await scanner_worker.start()
@@ -252,34 +417,90 @@ app = FastAPI(
 )
 
 cors_origins_env = os.getenv(
-    "CORS_ORIGINS", "http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000"
+    "CORS_ORIGINS",
+    "http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173",
 )
 allowed_origins = [origin.strip() for origin in cors_origins_env.split(",") if origin.strip()]
+allow_all_origins = allowed_origins == ["*"]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins or ["*"],
-    allow_credentials=True,
+    allow_origins=allowed_origins or ["http://localhost:3000", "http://localhost:5173"],
+    allow_credentials=not allow_all_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
 # ==========================================
+# Authentication & Session Endpoints
+# ==========================================
+@app.post("/api/auth/login", response_model=AuthTokenResponse)
+def login(payload: LoginRequest, response: Response):
+    principal = authenticate_credentials(
+        username=payload.username,
+        password=payload.password,
+        api_key=payload.api_key,
+    )
+    if principal is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid username, password, or API key.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    token = create_access_token(principal.username, principal.role)
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=token,
+        max_age=AUTH_TOKEN_TTL_SECONDS,
+        httponly=True,
+        samesite="lax",
+    )
+    return AuthTokenResponse(
+        access_token=token,
+        token_type="bearer",
+        username=principal.username,
+        role=principal.role.value,
+        expires_in=AUTH_TOKEN_TTL_SECONDS,
+    )
+
+
+@app.get("/api/auth/me", response_model=AuthUserRead)
+def get_current_user(principal: AuthPrincipal = Depends(require_authenticated)):
+    return AuthUserRead(
+        username=principal.username,
+        role=principal.role.value,
+        authenticated=True,
+    )
+
+
+@app.post("/api/auth/logout")
+def logout(response: Response):
+    response.delete_cookie(key=SESSION_COOKIE_NAME)
+    return {"status": "logged_out"}
+
+
+# ==========================================
 # Health & Navigation Tree Endpoints
 # ==========================================
 @app.get("/api/health")
-async def health_check():
-    return {
+async def health_check(principal: Optional[AuthPrincipal] = Depends(get_optional_principal)):
+    payload = {
         "status": "healthy",
         "scanner_running": scanner_worker.is_running,
-        "active_scans": list(scanner_worker.active_subnet_scans),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    if principal is not None:
+        payload["active_scans"] = list(scanner_worker.active_subnet_scans)
+    return payload
 
 
 @app.get("/api/tree", response_model=List[SiteTreeRead])
-def get_navigation_tree(db: Session = Depends(get_db)):
+def get_navigation_tree(
+    db: Session = Depends(get_db),
+    _principal: AuthPrincipal = Depends(require_authenticated),
+):
     """
     Returns the complete hierarchy of Sites and their nested Subnets with real-time
     utilization metrics for the persistent left-hand navigation tree.
@@ -297,7 +518,10 @@ def get_navigation_tree(db: Session = Depends(get_db)):
 # Site / Location CRUD Endpoints
 # ==========================================
 @app.get("/api/sites", response_model=List[SiteTreeRead])
-def list_sites(db: Session = Depends(get_db)):
+def list_sites(
+    db: Session = Depends(get_db),
+    _principal: AuthPrincipal = Depends(require_authenticated),
+):
     return (
         db.query(Site)
         .options(joinedload(Site.subnets))
@@ -307,7 +531,11 @@ def list_sites(db: Session = Depends(get_db)):
 
 
 @app.post("/api/sites", response_model=SiteTreeRead, status_code=201)
-def create_site(payload: SiteCreate, db: Session = Depends(get_db)):
+def create_site(
+    payload: SiteCreate,
+    db: Session = Depends(get_db),
+    _admin: AuthPrincipal = Depends(require_admin),
+):
     existing = db.query(Site).filter(Site.name.ilike(payload.name.strip())).first()
     if existing:
         raise HTTPException(status_code=409, detail=f"Site '{payload.name}' already exists.")
@@ -323,10 +551,16 @@ def create_site(payload: SiteCreate, db: Session = Depends(get_db)):
 
 
 @app.delete("/api/sites/{site_id}", status_code=204)
-def delete_site(site_id: int, db: Session = Depends(get_db)):
+def delete_site(
+    site_id: int,
+    db: Session = Depends(get_db),
+    _admin: AuthPrincipal = Depends(require_admin),
+):
     site = db.query(Site).filter(Site.id == site_id).first()
     if not site:
         raise HTTPException(status_code=404, detail="Site not found.")
+    for sub in site.subnets:
+        scanner_worker.reset_subnet_state(sub.id)
     db.delete(site)
     db.commit()
     return None
@@ -339,6 +573,7 @@ def delete_site(site_id: int, db: Session = Depends(get_db)):
 def list_subnets(
     site_id: Optional[int] = Query(None),
     db: Session = Depends(get_db),
+    _principal: AuthPrincipal = Depends(require_authenticated),
 ):
     query = db.query(SubnetScope)
     if site_id is not None:
@@ -347,7 +582,11 @@ def list_subnets(
 
 
 @app.get("/api/subnets/{subnet_id}", response_model=SubnetSummaryRead)
-def get_subnet(subnet_id: int, db: Session = Depends(get_db)):
+def get_subnet(
+    subnet_id: int,
+    db: Session = Depends(get_db),
+    _principal: AuthPrincipal = Depends(require_authenticated),
+):
     subnet = db.query(SubnetScope).filter(SubnetScope.id == subnet_id).first()
     if not subnet:
         raise HTTPException(status_code=404, detail="Subnet not found.")
@@ -358,14 +597,26 @@ def get_subnet(subnet_id: int, db: Session = Depends(get_db)):
 async def create_subnet(
     payload: SubnetCreate,
     db: Session = Depends(get_db),
+    _admin: AuthPrincipal = Depends(require_admin),
 ):
     site = db.query(Site).filter(Site.id == payload.site_id).first()
     if not site:
         raise HTTPException(status_code=404, detail=f"Site ID {payload.site_id} does not exist.")
 
-    existing = db.query(SubnetScope).filter(SubnetScope.cidr == payload.cidr).first()
-    if existing:
-        raise HTTPException(status_code=409, detail=f"Subnet CIDR '{payload.cidr}' is already registered.")
+    overlapping = find_overlapping_subnet(db, payload.cidr)
+    if overlapping is not None:
+        if overlapping.cidr == payload.cidr:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Subnet CIDR '{payload.cidr}' is already registered.",
+            )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Subnet CIDR '{payload.cidr}' overlaps with existing subnet "
+                f"'{overlapping.cidr}' ({overlapping.label})."
+            ),
+        )
 
     subnet = SubnetScope(
         site_id=payload.site_id,
@@ -392,12 +643,30 @@ def update_subnet(
     subnet_id: int,
     payload: SubnetUpdate,
     db: Session = Depends(get_db),
+    _admin: AuthPrincipal = Depends(require_admin),
 ):
     subnet = db.query(SubnetScope).filter(SubnetScope.id == subnet_id).first()
     if not subnet:
         raise HTTPException(status_code=404, detail="Subnet not found.")
 
     update_data = payload.model_dump(exclude_unset=True)
+    if "gateway_ip" in update_data:
+        gw_val = update_data["gateway_ip"]
+        if gw_val and gw_val.strip():
+            try:
+                gw_ip = ipaddress.ip_address(gw_val.strip())
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=f"Invalid gateway IP '{gw_val}': {exc}") from exc
+            net = ipaddress.ip_network(subnet.cidr, strict=False)
+            if gw_ip not in net:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Gateway IP '{gw_val}' does not belong to subnet CIDR '{subnet.cidr}'.",
+                )
+            update_data["gateway_ip"] = str(gw_ip)
+        else:
+            update_data["gateway_ip"] = None
+
     if "scan_interval_hours" in update_data:
         hours_val = update_data.pop("scan_interval_hours")
         if hours_val is not None:
@@ -407,21 +676,34 @@ def update_subnet(
 
     db.commit()
     db.refresh(subnet)
+
+    if subnet.scan_enabled and subnet.last_scanned_at is None:
+        scanner_worker.schedule_immediate_scan(subnet.id)
+
     return subnet
 
 
 @app.delete("/api/subnets/{subnet_id}", status_code=204)
-def delete_subnet(subnet_id: int, db: Session = Depends(get_db)):
+def delete_subnet(
+    subnet_id: int,
+    db: Session = Depends(get_db),
+    _admin: AuthPrincipal = Depends(require_admin),
+):
     subnet = db.query(SubnetScope).filter(SubnetScope.id == subnet_id).first()
     if not subnet:
         raise HTTPException(status_code=404, detail="Subnet not found.")
+    scanner_worker.reset_subnet_state(subnet_id)
     db.delete(subnet)
     db.commit()
     return None
 
 
 @app.post("/api/subnets/{subnet_id}/scan", response_model=SubnetSummaryRead)
-async def trigger_manual_subnet_scan(subnet_id: int, db: Session = Depends(get_db)):
+async def trigger_manual_subnet_scan(
+    subnet_id: int,
+    db: Session = Depends(get_db),
+    _admin: AuthPrincipal = Depends(require_admin),
+):
     """
     Immediate 'Rescan Now' endpoint at the subnet level. Launches an asynchronous
     non-blocking sweep of the subnet's IP range.
@@ -440,7 +722,11 @@ async def trigger_manual_subnet_scan(subnet_id: int, db: Session = Depends(get_d
 
 
 @app.delete("/api/subnets/{subnet_id}/history", response_model=SubnetSummaryRead)
-def clear_subnet_history(subnet_id: int, db: Session = Depends(get_db)):
+def clear_subnet_history(
+    subnet_id: int,
+    db: Session = Depends(get_db),
+    _admin: AuthPrincipal = Depends(require_admin),
+):
     """
     Clears all state transition / audit event logs for every IP record in the subnet
     and resets historical timestamps and sweep counters.
@@ -472,8 +758,10 @@ def clear_subnet_history(subnet_id: int, db: Session = Depends(get_db)):
     subnet.last_scanned_at = None
     subnet.last_scan_duration_ms = None
     subnet.scan_status = ScanStatus.IDLE
-
     subnet.suspected_unused_count = 0
+
+    scanner_worker.reset_subnet_state(subnet_id)
+
     db.commit()
     db.refresh(subnet)
     return subnet
@@ -487,6 +775,29 @@ def _execute_bulk_import(
     trigger_initial_scan: bool,
     db: Session,
 ) -> BulkSubnetImportResult:
+    # 1. Pre-flight validation for intra-batch and database CIDR overlap before mutating state
+    accepted_batch_cidrs: List[tuple[str, str]] = []
+    for item in items:
+        for prev_cidr, prev_label in accepted_batch_cidrs:
+            if cidrs_overlap(item.cidr, prev_cidr) and item.cidr != prev_cidr:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Overlapping CIDR blocks in import batch: '{item.cidr}' ({item.label}) "
+                        f"overlaps with '{prev_cidr}' ({prev_label})."
+                    ),
+                )
+        overlapping_db = find_overlapping_subnet(db, item.cidr)
+        if overlapping_db is not None and overlapping_db.cidr != item.cidr:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Subnet CIDR '{item.cidr}' overlaps with existing subnet "
+                    f"'{overlapping_db.cidr}' ({overlapping_db.label})."
+                ),
+            )
+        accepted_batch_cidrs.append((item.cidr, item.label))
+
     created_sites = 0
     created_subnets = 0
     skipped_cidrs: List[str] = []
@@ -502,10 +813,18 @@ def _execute_bulk_import(
             db.refresh(site)
             created_sites += 1
 
-        existing_subnet = db.query(SubnetScope).filter(SubnetScope.cidr == item.cidr).first()
-        if existing_subnet:
-            skipped_cidrs.append(item.cidr)
-            continue
+        overlapping = find_overlapping_subnet(db, item.cidr)
+        if overlapping is not None:
+            if overlapping.cidr == item.cidr:
+                skipped_cidrs.append(item.cidr)
+                continue
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Subnet CIDR '{item.cidr}' overlaps with existing subnet "
+                    f"'{overlapping.cidr}' ({overlapping.label})."
+                ),
+            )
 
         new_subnet = SubnetScope(
             site_id=site.id,
@@ -541,6 +860,7 @@ def _execute_bulk_import(
 async def bulk_import_subnets_json(
     payload: BulkSubnetImportRequest,
     db: Session = Depends(get_db),
+    _admin: AuthPrincipal = Depends(require_admin),
 ):
     """
     Bulk-imports sites, subnet CIDR scopes, and scan intervals from structured JSON.
@@ -555,6 +875,7 @@ async def bulk_import_subnets_csv(
     file: UploadFile = File(...),
     trigger_initial_scan: bool = Query(False),
     db: Session = Depends(get_db),
+    _admin: AuthPrincipal = Depends(require_admin),
 ):
     """
     Bulk-imports subnets from an uploaded CSV file with columns:
@@ -610,6 +931,7 @@ def list_subnet_ips(
     audit_flag: Optional[AuditFlag] = Query(None),
     q: Optional[str] = Query(None, description="Search filter for IP, hostname, owner, or notes"),
     db: Session = Depends(get_db),
+    _principal: AuthPrincipal = Depends(require_authenticated),
 ):
     subnet = db.query(SubnetScope).filter(SubnetScope.id == subnet_id).first()
     if not subnet:
@@ -635,7 +957,11 @@ def list_subnet_ips(
 
 
 @app.get("/api/ips/{ip_id}", response_model=IPRecordDetailRead)
-def get_ip_record_detail(ip_id: int, db: Session = Depends(get_db)):
+def get_ip_record_detail(
+    ip_id: int,
+    db: Session = Depends(get_db),
+    _principal: AuthPrincipal = Depends(require_authenticated),
+):
     ip_record = (
         db.query(IPRecord)
         .options(joinedload(IPRecord.audit_logs))
@@ -652,6 +978,7 @@ def update_ip_record_audit(
     ip_id: int,
     payload: IPRecordUpdate,
     db: Session = Depends(get_db),
+    _admin: AuthPrincipal = Depends(require_admin),
 ):
     ip_record = (
         db.query(IPRecord)
@@ -681,12 +1008,15 @@ def update_ip_record_audit(
         setattr(ip_record, field, value)
 
     if changes:
+        # Manual metadata updates do not transition host reachability status;
+        # leave previous_status and new_status unset so the audit log only
+        # reflects status transitions when reachability actually changes.
         audit_entry = AuditEventLog(
             ip_record_id=ip_record.id,
-            previous_status=ip_record.status,
-            new_status=ip_record.status,
+            previous_status=None,
+            new_status=None,
             event_type="MANUAL_AUDIT_UPDATE",
-            response_time_ms=ip_record.response_time_ms,
+            response_time_ms=None,
             details="; ".join(changes),
         )
         db.add(audit_entry)
@@ -713,7 +1043,11 @@ def update_ip_record_audit(
 
 
 @app.get("/api/ips/{ip_id}/logs", response_model=List[AuditEventLogRead])
-def get_ip_audit_logs(ip_id: int, db: Session = Depends(get_db)):
+def get_ip_audit_logs(
+    ip_id: int,
+    db: Session = Depends(get_db),
+    _principal: AuthPrincipal = Depends(require_authenticated),
+):
     ip_record = db.query(IPRecord).filter(IPRecord.id == ip_id).first()
     if not ip_record:
         raise HTTPException(status_code=404, detail="IP record not found.")
@@ -790,6 +1124,7 @@ def get_unused_ip_report(
     site_id: Optional[int] = Query(None),
     subnet_id: Optional[int] = Query(None),
     db: Session = Depends(get_db),
+    _principal: AuthPrincipal = Depends(require_authenticated),
 ):
     """
     Compiles a cross-subnet audit report of suspected unused, stale, or orphaned IPs
@@ -804,6 +1139,7 @@ def export_unused_ip_report(
     site_id: Optional[int] = Query(None),
     subnet_id: Optional[int] = Query(None),
     db: Session = Depends(get_db),
+    _principal: AuthPrincipal = Depends(require_authenticated),
 ):
     """
     Exports the suspected unused / orphaned IP audit report as downloadable CSV or JSON.

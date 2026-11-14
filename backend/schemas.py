@@ -3,9 +3,41 @@ import re
 from datetime import datetime
 from typing import List, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 
 from models import AuditFlag, IPStatus, ScanStatus
+
+
+def cidrs_overlap(cidr_a: str, cidr_b: str) -> bool:
+    """
+    Returns True if two IPv4 CIDR blocks overlap (including supernet/subnet containment).
+    """
+    net_a = ipaddress.ip_network(cidr_a.strip(), strict=False)
+    net_b = ipaddress.ip_network(cidr_b.strip(), strict=False)
+    return net_a.overlaps(net_b)
+
+
+# ==========================================
+# Authentication & Authorization Schemas
+# ==========================================
+class LoginRequest(BaseModel):
+    username: Optional[str] = Field(default=None, max_length=120)
+    password: Optional[str] = Field(default=None, max_length=255)
+    api_key: Optional[str] = Field(default=None, max_length=255)
+
+
+class AuthTokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    username: str
+    role: str
+    expires_in: int
+
+
+class AuthUserRead(BaseModel):
+    username: str
+    role: str
+    authenticated: bool = True
 
 
 # ==========================================
@@ -17,7 +49,7 @@ class AuditEventLogRead(BaseModel):
     id: int
     ip_record_id: int
     previous_status: Optional[IPStatus] = None
-    new_status: IPStatus
+    new_status: Optional[IPStatus] = None
     event_type: str
     response_time_ms: Optional[float] = None
     details: Optional[str] = None
@@ -101,6 +133,24 @@ class SubnetBase(BaseModel):
             raise ValueError("scan_cron_time must be in HH:MM (24-hour) format.")
         return cleaned
 
+    @model_validator(mode="after")
+    def validate_gateway_in_cidr(self) -> "SubnetBase":
+        if self.gateway_ip and self.gateway_ip.strip():
+            gw_clean = self.gateway_ip.strip()
+            try:
+                gw_ip = ipaddress.ip_address(gw_clean)
+            except ValueError as exc:
+                raise ValueError(f"Invalid gateway IP '{gw_clean}': {exc}") from exc
+            network = ipaddress.ip_network(self.cidr, strict=False)
+            if gw_ip not in network:
+                raise ValueError(
+                    f"Gateway IP '{gw_clean}' does not belong to subnet CIDR '{self.cidr}'."
+                )
+            self.gateway_ip = str(gw_ip)
+        else:
+            self.gateway_ip = None
+        return self
+
 
 class SubnetCreate(SubnetBase):
     site_id: int
@@ -113,6 +163,11 @@ class SubnetUpdate(BaseModel):
     scan_enabled: Optional[bool] = None
     scan_interval_hours: Optional[int] = Field(None, ge=1, le=720)
     scan_cron_time: Optional[str] = None
+
+    @field_validator("scan_cron_time")
+    @classmethod
+    def validate_update_cron_time(cls, value: Optional[str]) -> Optional[str]:
+        return SubnetBase.validate_cron_time(value)
 
 
 class SubnetSummaryRead(BaseModel):
@@ -186,10 +241,47 @@ class BulkSubnetImportItem(BaseModel):
     def validate_item_cidr(cls, value: str) -> str:
         return SubnetBase.validate_cidr(value)
 
+    @field_validator("scan_cron_time")
+    @classmethod
+    def validate_item_cron_time(cls, value: Optional[str]) -> Optional[str]:
+        return SubnetBase.validate_cron_time(value)
+
+    @model_validator(mode="after")
+    def validate_item_gateway_in_cidr(self) -> "BulkSubnetImportItem":
+        if self.gateway_ip and self.gateway_ip.strip():
+            gw_clean = self.gateway_ip.strip()
+            try:
+                gw_ip = ipaddress.ip_address(gw_clean)
+            except ValueError as exc:
+                raise ValueError(f"Invalid gateway IP '{gw_clean}': {exc}") from exc
+            network = ipaddress.ip_network(self.cidr, strict=False)
+            if gw_ip not in network:
+                raise ValueError(
+                    f"Gateway IP '{gw_clean}' does not belong to subnet CIDR '{self.cidr}'."
+                )
+            self.gateway_ip = str(gw_ip)
+        else:
+            self.gateway_ip = None
+        return self
+
 
 class BulkSubnetImportRequest(BaseModel):
     subnets: List[BulkSubnetImportItem]
     trigger_initial_scan: bool = False
+
+    @model_validator(mode="after")
+    def validate_no_overlapping_cidrs_in_batch(self) -> "BulkSubnetImportRequest":
+        seen_networks: List[tuple[ipaddress.IPv4Network, str]] = []
+        for item in self.subnets:
+            net = ipaddress.ip_network(item.cidr, strict=False)
+            for prev_net, prev_label in seen_networks:
+                if net.overlaps(prev_net) and net != prev_net:
+                    raise ValueError(
+                        f"Overlapping CIDR blocks in import payload: '{item.cidr}' ({item.label}) "
+                        f"overlaps with '{prev_net}' ({prev_label})."
+                    )
+            seen_networks.append((net, item.label))
+        return self
 
 
 class BulkSubnetImportResult(BaseModel):

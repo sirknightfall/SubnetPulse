@@ -1,9 +1,10 @@
 import enum
+import ipaddress
 from datetime import datetime, timezone
 from typing import List, Optional
 
 from sqlalchemy import (
-    Boolean,
+     Boolean,
     DateTime,
     Enum,
     Float,
@@ -13,14 +14,26 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
+    select,
 )
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from database import Base
 
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def compute_cidr_bounds(cidr: str) -> tuple[str, int, int]:
+    """
+    Normalizes an IPv4 CIDR string and returns (normalized_cidr, network_start_int, broadcast_end_int).
+    """
+    network = ipaddress.ip_network(cidr.strip(), strict=False)
+    if network.version != 4:
+        raise ValueError("Only IPv4 CIDR blocks are supported.")
+    return str(network), int(network.network_address), int(network.broadcast_address)
 
 
 class IPStatus(str, enum.Enum):
@@ -75,12 +88,18 @@ class SubnetScope(Base):
     scanning schedule configurations, and historical scan metadata. Has many IP Addresses.
     """
     __tablename__ = "subnets"
+    __table_args__ = (
+        UniqueConstraint("network_start_int", "broadcast_end_int", name="uq_subnet_network_bounds"),
+        Index("ix_subnets_network_bounds", "network_start_int", "broadcast_end_int"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     site_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("sites.id", ondelete="CASCADE"), nullable=False, index=True
     )
     cidr: Mapped[str] = mapped_column(String(43), unique=True, nullable=False, index=True)
+    network_start_int: Mapped[int] = mapped_column(Integer, nullable=False, index=True, default=0)
+    broadcast_end_int: Mapped[int] = mapped_column(Integer, nullable=False, index=True, default=0)
     label: Mapped[str] = mapped_column(String(160), nullable=False)
     vlan_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     gateway_ip: Mapped[Optional[str]] = mapped_column(String(45), nullable=True)
@@ -117,6 +136,36 @@ class SubnetScope(Base):
         order_by="IPRecord.ip_integer",
     )
 
+    @validates("cidr")
+    def _validate_and_normalize_cidr(self, key: str, value: str) -> str:
+        normalized_cidr, start_int, end_int = compute_cidr_bounds(value)
+        self.network_start_int = start_int
+        self.broadcast_end_int = end_int
+        return normalized_cidr
+
+
+@event.listens_for(SubnetScope, "before_insert")
+@event.listens_for(SubnetScope, "before_update")
+def _enforce_non_overlapping_subnet(mapper, connection, target: SubnetScope) -> None:
+    normalized_cidr, start_int, end_int = compute_cidr_bounds(target.cidr)
+    target.cidr = normalized_cidr
+    target.network_start_int = start_int
+    target.broadcast_end_int = end_int
+
+    subnets_table = SubnetScope.__table__
+    stmt = select(subnets_table.c.id, subnets_table.c.cidr, subnets_table.c.label).where(
+        subnets_table.c.network_start_int <= end_int,
+        subnets_table.c.broadcast_end_int >= start_int,
+    )
+    if target.id is not None:
+        stmt = stmt.where(subnets_table.c.id != target.id)
+
+    conflict = connection.execute(stmt).first()
+    if conflict is not None:
+        raise ValueError(
+            f"Subnet CIDR '{target.cidr}' overlaps with existing subnet '{conflict.cidr}' ({conflict.label})."
+        )
+
 
 class IPRecord(Base):
     """
@@ -127,6 +176,8 @@ class IPRecord(Base):
     __tablename__ = "ip_records"
     __table_args__ = (
         UniqueConstraint("subnet_id", "ip_address", name="uq_subnet_ip_address"),
+        UniqueConstraint("ip_address", name="uq_ip_records_ip_address"),
+        UniqueConstraint("ip_integer", name="uq_ip_records_ip_integer"),
         Index("ix_ip_records_subnet_status", "subnet_id", "status"),
     )
 
@@ -175,8 +226,8 @@ class IPRecord(Base):
 class AuditEventLog(Base):
     """
     4. Audit Event Log (Related to IP Records) -> Tracks state transition history
-    (e.g., Offline -> Online, Unknown -> Online, Manual Flag Update) for auditing
-    lingering ghost devices and verifying stale IP cleanup over time.
+    (e.g., Offline -> Online, Unknown -> Online) and manual audit metadata updates
+    for investigating lingering ghost devices and verifying stale IP cleanup over time.
     """
     __tablename__ = "audit_event_logs"
     __table_args__ = (
@@ -188,7 +239,7 @@ class AuditEventLog(Base):
         Integer, ForeignKey("ip_records.id", ondelete="CASCADE"), nullable=False, index=True
     )
     previous_status: Mapped[Optional[IPStatus]] = mapped_column(Enum(IPStatus), nullable=True)
-    new_status: Mapped[IPStatus] = mapped_column(Enum(IPStatus), nullable=False)
+    new_status: Mapped[Optional[IPStatus]] = mapped_column(Enum(IPStatus), nullable=True)
     event_type: Mapped[str] = mapped_column(
         String(64), nullable=False, default="STATE_TRANSITION"
     )

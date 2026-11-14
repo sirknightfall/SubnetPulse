@@ -9,7 +9,6 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set, Tuple
 
-from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from database import SessionLocal
@@ -31,7 +30,6 @@ async def async_icmp_ping(ip_address: str, timeout: float = PING_TIMEOUT_SECONDS
     and extracts round-trip latency in milliseconds if reachable.
     Falls back to a non-blocking TCP handshake probe on port 80/443/22 if raw ICMP is restricted.
     """
-    # Validate IP address using Python's ipaddress module
     ip_obj = ipaddress.ip_address(ip_address)
     ip_str = str(ip_obj)
 
@@ -142,6 +140,13 @@ class SubnetScannerWorker:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
         logger.info("SubnetScannerWorker stopped cleanly.")
 
+    def reset_subnet_state(self, subnet_id: int) -> None:
+        """
+        Clears cached scheduler state (such as daily cron trigger history) when a subnet
+        is reset or deleted so subsequent scans are not suppressed.
+        """
+        self._last_cron_trigger_date.pop(subnet_id, None)
+
     def _create_scan_task(self, subnet_id: int) -> None:
         if subnet_id in self.active_subnet_scans:
             return
@@ -215,7 +220,6 @@ class SubnetScannerWorker:
 
             logger.info("Starting async sweep for subnet %s (%d hosts)...", subnet_cidr, len(probe_targets))
 
-            # Execute all host probes concurrently via asyncio.gather
             probe_tasks = [
                 self._probe_single_ip(ip_id, ip_str, hostname)
                 for ip_id, ip_str, hostname in probe_targets
@@ -272,6 +276,7 @@ class SubnetScannerWorker:
             is_online, rtt_ms, resolved_hostname = probe_outcome
             previous_status = record.status
             new_status = IPStatus.ONLINE if is_online else IPStatus.OFFLINE
+            status_changed = previous_status != new_status
 
             record.last_checked_at = now_utc
             record.response_time_ms = rtt_ms
@@ -285,18 +290,18 @@ class SubnetScannerWorker:
                 record.last_seen_online_at = now_utc
                 record.consecutive_offline_scans = 0
 
-                # Flag unexpected ghost device if marked Expected Decommissioned or unallocated
+                # Flag unexpected ghost device if marked Expected Decommissioned
                 if record.audit_flag == AuditFlag.EXPECTED_DECOMMISSIONED:
                     record.audit_flag = AuditFlag.GHOST_DEVICE
                     new_audit_logs.append(
                         AuditEventLog(
                             ip_record_id=record.id,
-                            previous_status=previous_status,
-                            new_status=new_status,
+                            previous_status=previous_status if status_changed else None,
+                            new_status=new_status if status_changed else None,
                             event_type="GHOST_DEVICE_DETECTED",
                             response_time_ms=rtt_ms,
                             details=(
-                                f"Hostmarked Expected Decommissioned responded to ICMP ping ({rtt_ms} ms); "
+                                f"Host marked Expected Decommissioned responded to ICMP ping ({rtt_ms} ms); "
                                 "auto-escalated to Ghost Device."
                             ),
                             timestamp=now_utc,
@@ -316,8 +321,8 @@ class SubnetScannerWorker:
                     new_audit_logs.append(
                         AuditEventLog(
                             ip_record_id=record.id,
-                            previous_status=previous_status,
-                            new_status=new_status,
+                            previous_status=previous_status if status_changed else None,
+                            new_status=new_status if status_changed else None,
                             event_type="AUTO_FLAG_SUSPECTED_UNUSED",
                             response_time_ms=None,
                             details=(
@@ -329,7 +334,7 @@ class SubnetScannerWorker:
                     )
 
             # Log every state transition (e.g., Unknown -> Online, Offline -> Online, Online -> Offline)
-            if previous_status != new_status:
+            if status_changed:
                 record.status = new_status
                 record.state_change_count += 1
                 transition_detail = (
@@ -373,6 +378,52 @@ class SubnetScannerWorker:
         subnet.scan_status = ScanStatus.COMPLETED
         db.commit()
 
+    def evaluate_due_subnets(self, db: Session, now_utc: Optional[datetime] = None) -> List[int]:
+        """
+        Determines which enabled subnets are due for a scan at `now_utc`.
+        Subnets with `last_scanned_at is None` (initial state or after a history reset)
+        are scheduled immediately so automatic scanning never stalls.
+        """
+        if now_utc is None:
+            now_utc = datetime.now(timezone.utc)
+        current_hhmm = now_utc.strftime("%H:%M")
+        current_date_str = now_utc.strftime("%Y-%m-%d")
+
+        due_subnet_ids: List[int] = []
+        enabled_subnets = (
+            db.query(SubnetScope)
+            .filter(SubnetScope.scan_enabled.is_(True))
+            .all()
+        )
+
+        for subnet in enabled_subnets:
+            if subnet.id in self.active_subnet_scans:
+                continue
+
+            # 1. Check daily HH:MM cron schedule if configured
+            if subnet.scan_cron_time and subnet.scan_cron_time == current_hhmm:
+                last_fired_date = self._last_cron_trigger_date.get(subnet.id)
+                if last_fired_date != current_date_str:
+                    self._last_cron_trigger_date[subnet.id] = current_date_str
+                    due_subnet_ids.append(subnet.id)
+                    continue
+
+            # 2. Check interval-based schedule:
+            # Never-scanned or history-cleared subnets (last_scanned_at is None) are due immediately.
+            if subnet.last_scanned_at is None:
+                due_subnet_ids.append(subnet.id)
+                continue
+
+            last_scan = subnet.last_scanned_at
+            if last_scan.tzinfo is None:
+                last_scan = last_scan.replace(tzinfo=timezone.utc)
+
+            next_due = last_scan + timedelta(minutes=max(1, subnet.scan_interval_minutes))
+            if now_utc >= next_due:
+                due_subnet_ids.append(subnet.id)
+
+        return due_subnet_ids
+
     async def _scheduler_loop(self) -> None:
         """
         Periodic scheduler evaluating both interval-based sweeps (scan_interval_minutes)
@@ -381,41 +432,8 @@ class SubnetScannerWorker:
         while self._running:
             try:
                 now_utc = datetime.now(timezone.utc)
-                current_hhmm = now_utc.strftime("%H:%M")
-                current_date_str = now_utc.strftime("%Y-%m-%d")
-
-                due_subnet_ids: List[int] = []
-
                 with SessionLocal() as db:
-                    enabled_subnets = (
-                        db.query(SubnetScope)
-                        .filter(SubnetScope.scan_enabled.is_(True))
-                        .all()
-                    )
-
-                    for subnet in enabled_subnets:
-                        if subnet.id in self.active_subnet_scans:
-                            continue
-
-                        # 1. Check daily HH:MM cron schedule if configured
-                        if subnet.scan_cron_time and subnet.scan_cron_time == current_hhmm:
-                            last_fired_date = self._last_cron_trigger_date.get(subnet.id)
-                            if last_fired_date != current_date_str:
-                                self._last_cron_trigger_date[subnet.id] = current_date_str
-                                due_subnet_ids.append(subnet.id)
-                                continue
-
-                        # 2. Check interval-based schedule
-                        if subnet.last_scanned_at is None:
-                            continue
-
-                        last_scan = subnet.last_scanned_at
-                        if last_scan.tzinfo is None:
-                            last_scan = last_scan.replace(tzinfo=timezone.utc)
-
-                        next_due = last_scan + timedelta(minutes=max(1, subnet.scan_interval_minutes))
-                        if now_utc >= next_due:
-                            due_subnet_ids.append(subnet.id)
+                    due_subnet_ids = self.evaluate_due_subnets(db, now_utc)
 
                 for subnet_id in due_subnet_ids:
                     self.schedule_immediate_scan(subnet_id)
