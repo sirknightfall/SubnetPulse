@@ -4,7 +4,7 @@ import ipaddress
 import json
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Response, UploadFile
@@ -19,9 +19,13 @@ from auth import (
     AuthPrincipal,
     authenticate_credentials,
     create_access_token,
+    generate_scoped_api_key,
     get_optional_principal,
+    hash_password,
     require_admin,
     require_authenticated,
+    seed_initial_users,
+    verify_password,
 )
 from database import Base, SessionLocal, engine, get_db
 from models import (
@@ -32,7 +36,11 @@ from models import (
     ScanStatus,
     Site,
     SubnetScope,
+    User,
+    UserAPIKey,
+    UserRole,
     compute_cidr_bounds,
+    utcnow,
 )
 from scanner import scanner_worker
 from schemas import (
@@ -42,6 +50,7 @@ from schemas import (
     BulkSubnetImportItem,
     BulkSubnetImportRequest,
     BulkSubnetImportResult,
+    ChangePasswordRequest,
     IPRecordDetailRead,
     IPRecordRead,
     IPRecordUpdate,
@@ -52,6 +61,12 @@ from schemas import (
     SubnetCreate,
     SubnetSummaryRead,
     SubnetUpdate,
+    UserAPIKeyCreate,
+    UserAPIKeyCreatedResponse,
+    UserAPIKeyRead,
+    UserCreate,
+    UserRead,
+    UserUpdate,
     cidrs_overlap,
 )
 
@@ -59,112 +74,134 @@ from schemas import (
 def ensure_schema_compatibility() -> None:
     """
     Ensures existing SQLite databases created by earlier versions of SubnetPulse
-    are migrated in-place (adding network bound columns on `subnets` and relaxing
-    `NOT NULL` on `audit_event_logs.new_status`).
+    are migrated in-place (adding network bound columns on `subnets`, relaxing
+    `NOT NULL` on `audit_event_logs.new_status`, adding `actor_username`, and
+    seeding initial operator accounts).
     """
     Base.metadata.create_all(bind=engine)
-    if not str(engine.url).startswith("sqlite"):
-        return
+    if str(engine.url).startswith("sqlite"):
+        with engine.begin() as conn:
+            subnet_cols = {
+                row[1]: row for row in conn.execute(text("PRAGMA table_info(subnets)")).fetchall()
+            }
+            if subnet_cols:
+                if "network_start_int" not in subnet_cols:
+                    conn.execute(
+                        text("ALTER TABLE subnets ADD COLUMN network_start_int INTEGER NOT NULL DEFAULT 0")
+                    )
+                if "broadcast_end_int" not in subnet_cols:
+                    conn.execute(
+                        text("ALTER TABLE subnets ADD COLUMN broadcast_end_int INTEGER NOT NULL DEFAULT 0")
+                    )
 
-    with engine.begin() as conn:
-        subnet_cols = {
-            row[1]: row for row in conn.execute(text("PRAGMA table_info(subnets)")).fetchall()
-        }
-        if subnet_cols:
-            if "network_start_int" not in subnet_cols:
-                conn.execute(
-                    text("ALTER TABLE subnets ADD COLUMN network_start_int INTEGER NOT NULL DEFAULT 0")
-                )
-            if "broadcast_end_int" not in subnet_cols:
-                conn.execute(
-                    text("ALTER TABLE subnets ADD COLUMN broadcast_end_int INTEGER NOT NULL DEFAULT 0")
-                )
+                rows = conn.execute(text("SELECT id, cidr FROM subnets")).fetchall()
+                for row_id, cidr_val in rows:
+                    norm_cidr, start_int, end_int = compute_cidr_bounds(cidr_val)
+                    conn.execute(
+                        text(
+                            "UPDATE subnets SET cidr = :c, network_start_int = :s, broadcast_end_int = :e "
+                            "WHERE id = :id"
+                        ),
+                        {"c": norm_cidr, "s": start_int, "e": end_int, "id": row_id},
+                    )
 
-            rows = conn.execute(text("SELECT id, cidr FROM subnets")).fetchall()
-            for row_id, cidr_val in rows:
-                norm_cidr, start_int, end_int = compute_cidr_bounds(cidr_val)
+            audit_cols = {
+                row[1]: row for row in conn.execute(text("PRAGMA table_info(audit_event_logs)")).fetchall()
+            }
+            if "new_status" in audit_cols and audit_cols["new_status"][3] == 1:
+                # SQLite column `notnull` is 1; rebuild table with nullable `new_status` and `actor_username`
+                has_actor = "actor_username" in audit_cols
+                actor_select = "actor_username" if has_actor else "NULL"
                 conn.execute(
                     text(
-                        "UPDATE subnets SET cidr = :c, network_start_int = :s, broadcast_end_int = :e "
-                        "WHERE id = :id"
-                    ),
-                    {"c": norm_cidr, "s": start_int, "e": end_int, "id": row_id},
+                        """
+                        CREATE TABLE audit_event_logs_new (
+                            id INTEGER NOT NULL PRIMARY KEY,
+                            ip_record_id INTEGER NOT NULL REFERENCES ip_records (id) ON DELETE CASCADE,
+                            previous_status VARCHAR(7),
+                            new_status VARCHAR(7),
+                            event_type VARCHAR(64) NOT NULL,
+                            actor_username VARCHAR(120),
+                            response_time_ms FLOAT,
+                            details TEXT,
+                            timestamp DATETIME NOT NULL
+                        )
+                        """
+                    )
+                )
+                conn.execute(
+                    text(
+                        f"""
+                        INSERT INTO audit_event_logs_new (
+                            id, ip_record_id, previous_status, new_status,
+                            event_type, actor_username, response_time_ms, details, timestamp
+                        )
+                        SELECT
+                            id,
+                            ip_record_id,
+                            CASE WHEN event_type = 'MANUAL_AUDIT_UPDATE' THEN NULL ELSE previous_status END,
+                            CASE WHEN event_type = 'MANUAL_AUDIT_UPDATE' THEN NULL ELSE new_status END,
+                            event_type,
+                            {actor_select},
+                            CASE WHEN event_type = 'MANUAL_AUDIT_UPDATE' THEN NULL ELSE response_time_ms END,
+                            details,
+                            timestamp
+                        FROM audit_event_logs
+                        """
+                    )
+                )
+                conn.execute(text("DROP TABLE audit_event_logs"))
+                conn.execute(text("ALTER TABLE audit_event_logs_new RENAME TO audit_event_logs"))
+                conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS ix_audit_event_logs_id ON audit_event_logs (id)"
+                    )
+                )
+                conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS ix_audit_event_logs_ip_record_id "
+                        "ON audit_event_logs (ip_record_id)"
+                    )
+                )
+                conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS ix_audit_event_logs_actor_username "
+                        "ON audit_event_logs (actor_username)"
+                    )
+                )
+                conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS ix_audit_event_logs_timestamp "
+                        "ON audit_event_logs (timestamp)"
+                    )
+                )
+                conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS ix_audit_logs_ip_timestamp "
+                        "ON audit_event_logs (ip_record_id, timestamp)"
+                    )
+                )
+            elif audit_cols:
+                if "actor_username" not in audit_cols:
+                    conn.execute(
+                        text("ALTER TABLE audit_event_logs ADD COLUMN actor_username VARCHAR(120)")
+                    )
+                    conn.execute(
+                        text(
+                            "CREATE INDEX IF NOT EXISTS ix_audit_event_logs_actor_username "
+                            "ON audit_event_logs (actor_username)"
+                        )
+                    )
+                conn.execute(
+                    text(
+                        "UPDATE audit_event_logs "
+                        "SET previous_status = NULL, new_status = NULL, response_time_ms = NULL "
+                        "WHERE event_type = 'MANUAL_AUDIT_UPDATE' AND previous_status = new_status"
+                    )
                 )
 
-        audit_cols = {
-            row[1]: row for row in conn.execute(text("PRAGMA table_info(audit_event_logs)")).fetchall()
-        }
-        if "new_status" in audit_cols and audit_cols["new_status"][3] == 1:
-            # SQLite column `notnull` is 1; rebuild table with nullable `new_status`
-            conn.execute(
-                text(
-                    """
-                    CREATE TABLE audit_event_logs_new (
-                        id INTEGER NOT NULL PRIMARY KEY,
-                        ip_record_id INTEGER NOT NULL REFERENCES ip_records (id) ON DELETE CASCADE,
-                        previous_status VARCHAR(7),
-                        new_status VARCHAR(7),
-                        event_type VARCHAR(64) NOT NULL,
-                        response_time_ms FLOAT,
-                        details TEXT,
-                        timestamp DATETIME NOT NULL
-                    )
-                    """
-                )
-            )
-            conn.execute(
-                text(
-                    """
-                    INSERT INTO audit_event_logs_new (
-                        id, ip_record_id, previous_status, new_status,
-                        event_type, response_time_ms, details, timestamp
-                    )
-                    SELECT
-                        id,
-                        ip_record_id,
-                        CASE WHEN event_type = 'MANUAL_AUDIT_UPDATE' THEN NULL ELSE previous_status END,
-                        CASE WHEN event_type = 'MANUAL_AUDIT_UPDATE' THEN NULL ELSE new_status END,
-                        event_type,
-                        CASE WHEN event_type = 'MANUAL_AUDIT_UPDATE' THEN NULL ELSE response_time_ms END,
-                        details,
-                        timestamp
-                    FROM audit_event_logs
-                    """
-                )
-            )
-            conn.execute(text("DROP TABLE audit_event_logs"))
-            conn.execute(text("ALTER TABLE audit_event_logs_new RENAME TO audit_event_logs"))
-            conn.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS ix_audit_event_logs_id ON audit_event_logs (id)"
-                )
-            )
-            conn.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS ix_audit_event_logs_ip_record_id "
-                    "ON audit_event_logs (ip_record_id)"
-                )
-            )
-            conn.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS ix_audit_event_logs_timestamp "
-                    "ON audit_event_logs (timestamp)"
-                )
-            )
-            conn.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS ix_audit_logs_ip_timestamp "
-                    "ON audit_event_logs (ip_record_id, timestamp)"
-                )
-            )
-        elif "new_status" in audit_cols:
-            conn.execute(
-                text(
-                    "UPDATE audit_event_logs "
-                    "SET previous_status = NULL, new_status = NULL, response_time_ms = NULL "
-                    "WHERE event_type = 'MANUAL_AUDIT_UPDATE' AND previous_status = new_status"
-                )
-            )
+    with SessionLocal() as db:
+        seed_initial_users(db)
 
 
 def find_overlapping_subnet(
@@ -433,14 +470,15 @@ app.add_middleware(
 
 
 # ==========================================
-# Authentication & Session Endpoints
+# Authentication, Self-Service & User Management Endpoints
 # ==========================================
 @app.post("/api/auth/login", response_model=AuthTokenResponse)
-def login(payload: LoginRequest, response: Response):
+def login(payload: LoginRequest, response: Response, db: Session = Depends(get_db)):
     principal = authenticate_credentials(
         username=payload.username,
         password=payload.password,
         api_key=payload.api_key,
+        db=db,
     )
     if principal is None:
         raise HTTPException(
@@ -449,7 +487,11 @@ def login(payload: LoginRequest, response: Response):
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    token = create_access_token(principal.username, principal.role)
+    token = create_access_token(
+        principal.username,
+        principal.role,
+        user_id=principal.user_id,
+    )
     response.set_cookie(
         key=SESSION_COOKIE_NAME,
         value=token,
@@ -460,6 +502,7 @@ def login(payload: LoginRequest, response: Response):
     return AuthTokenResponse(
         access_token=token,
         token_type="bearer",
+        user_id=principal.user_id,
         username=principal.username,
         role=principal.role.value,
         expires_in=AUTH_TOKEN_TTL_SECONDS,
@@ -469,6 +512,7 @@ def login(payload: LoginRequest, response: Response):
 @app.get("/api/auth/me", response_model=AuthUserRead)
 def get_current_user(principal: AuthPrincipal = Depends(require_authenticated)):
     return AuthUserRead(
+        user_id=principal.user_id,
         username=principal.username,
         role=principal.role.value,
         authenticated=True,
@@ -479,6 +523,301 @@ def get_current_user(principal: AuthPrincipal = Depends(require_authenticated)):
 def logout(response: Response):
     response.delete_cookie(key=SESSION_COOKIE_NAME)
     return {"status": "logged_out"}
+
+
+@app.post("/api/auth/change-password")
+def change_own_password(
+    payload: ChangePasswordRequest,
+    db: Session = Depends(get_db),
+    principal: AuthPrincipal = Depends(require_authenticated),
+):
+    user = db.query(User).filter(User.username.ilike(principal.username)).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User account not found.")
+
+    if not verify_password(payload.current_password, user.password_hash):
+        raise HTTPException(status_code=400, detail="Current password is incorrect.")
+
+    user.password_hash = hash_password(payload.new_password)
+    db.commit()
+    return {"status": "password_updated", "username": user.username}
+
+
+def _create_api_key_for_user(
+    db: Session,
+    user: User,
+    payload: UserAPIKeyCreate,
+) -> UserAPIKeyCreatedResponse:
+    raw_key, key_prefix, key_hash = generate_scoped_api_key()
+    expires_at = payload.expires_at
+    if expires_at is None and payload.expires_in_days is not None:
+        expires_at = utcnow() + timedelta(days=payload.expires_in_days)
+    elif expires_at is not None and expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+
+    key_row = UserAPIKey(
+        user_id=user.id,
+        name=payload.name.strip(),
+        key_prefix=key_prefix,
+        key_hash=key_hash,
+        is_active=True,
+        expires_at=expires_at,
+    )
+    db.add(key_row)
+    db.commit()
+    db.refresh(key_row)
+
+    return UserAPIKeyCreatedResponse(
+        id=key_row.id,
+        user_id=key_row.user_id,
+        name=key_row.name,
+        key_prefix=key_row.key_prefix,
+        is_active=key_row.is_active,
+        expires_at=key_row.expires_at,
+        last_used_at=key_row.last_used_at,
+        created_at=key_row.created_at,
+        api_key=raw_key,
+    )
+
+
+@app.get("/api/auth/api-keys", response_model=List[UserAPIKeyRead])
+def list_own_api_keys(
+    db: Session = Depends(get_db),
+    principal: AuthPrincipal = Depends(require_authenticated),
+):
+    user = db.query(User).filter(User.username.ilike(principal.username)).first()
+    if not user:
+        return []
+    return (
+        db.query(UserAPIKey)
+        .filter(UserAPIKey.user_id == user.id)
+        .order_by(UserAPIKey.created_at.desc())
+        .all()
+    )
+
+
+@app.post("/api/auth/api-keys", response_model=UserAPIKeyCreatedResponse, status_code=201)
+def create_own_api_key(
+    payload: UserAPIKeyCreate,
+    db: Session = Depends(get_db),
+    principal: AuthPrincipal = Depends(require_authenticated),
+):
+    user = db.query(User).filter(User.username.ilike(principal.username)).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User account not found.")
+    return _create_api_key_for_user(db, user, payload)
+
+
+@app.delete("/api/auth/api-keys/{key_id}", status_code=204)
+def revoke_own_api_key(
+    key_id: int,
+    db: Session = Depends(get_db),
+    principal: AuthPrincipal = Depends(require_authenticated),
+):
+    user = db.query(User).filter(User.username.ilike(principal.username)).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User account not found.")
+
+    key_row = db.query(UserAPIKey).filter(UserAPIKey.id == key_id).first()
+    if not key_row or (key_row.user_id != user.id and principal.role != UserRole.ADMIN):
+        raise HTTPException(status_code=404, detail="API key not found.")
+
+    db.delete(key_row)
+    db.commit()
+    return None
+
+
+@app.get("/api/users", response_model=List[UserRead])
+def list_users(
+    db: Session = Depends(get_db),
+    _admin: AuthPrincipal = Depends(require_admin),
+):
+    return (
+        db.query(User)
+        .options(joinedload(User.api_keys))
+        .order_by(User.id.asc())
+        .all()
+    )
+
+
+@app.post("/api/users", response_model=UserRead, status_code=201)
+def create_user(
+    payload: UserCreate,
+    db: Session = Depends(get_db),
+    _admin: AuthPrincipal = Depends(require_admin),
+):
+    username_clean = payload.username.strip()
+    existing = db.query(User).filter(User.username.ilike(username_clean)).first()
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"User '{username_clean}' already exists.",
+        )
+
+    user = User(
+        username=username_clean,
+        password_hash=hash_password(payload.password),
+        role=payload.role,
+        is_active=payload.is_active,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@app.patch("/api/users/{user_id}", response_model=UserRead)
+def update_user(
+    user_id: int,
+    payload: UserUpdate,
+    db: Session = Depends(get_db),
+    admin: AuthPrincipal = Depends(require_admin),
+):
+    user = (
+        db.query(User)
+        .options(joinedload(User.api_keys))
+        .filter(User.id == user_id)
+        .first()
+    )
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    update_data = payload.model_dump(exclude_unset=True)
+    new_role = update_data.get("role", user.role)
+    new_active = update_data.get("is_active", user.is_active)
+
+    # Prevent an admin from deactivating or demoting their own active session
+    if user.username.lower() == admin.username.lower():
+        if not new_active:
+            raise HTTPException(
+                status_code=400,
+                detail="You cannot disable your own active administrator account.",
+            )
+        if new_role != UserRole.ADMIN:
+            raise HTTPException(
+                status_code=400,
+                detail="You cannot demote your own active administrator account.",
+            )
+
+    # Prevent removing or disabling the last active admin
+    if user.role == UserRole.ADMIN and user.is_active and (
+        new_role != UserRole.ADMIN or not new_active
+    ):
+        other_active_admins = (
+            db.query(User)
+            .filter(
+                User.id != user.id,
+                User.role == UserRole.ADMIN,
+                User.is_active.is_(True),
+            )
+            .count()
+        )
+        if other_active_admins == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot demote or disable the last active administrator account.",
+            )
+
+    if "role" in update_data and update_data["role"] is not None:
+        user.role = update_data["role"]
+    if "is_active" in update_data and update_data["is_active"] is not None:
+        user.is_active = update_data["is_active"]
+    if "password" in update_data and update_data["password"]:
+        user.password_hash = hash_password(update_data["password"])
+
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@app.delete("/api/users/{user_id}", status_code=204)
+def delete_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    admin: AuthPrincipal = Depends(require_admin),
+):
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    if user.username.lower() == admin.username.lower():
+        raise HTTPException(
+            status_code=400,
+            detail="You cannot delete your own active administrator account.",
+        )
+
+    if user.role == UserRole.ADMIN and user.is_active:
+        other_active_admins = (
+            db.query(User)
+            .filter(
+                User.id != user.id,
+                User.role == UserRole.ADMIN,
+                User.is_active.is_(True),
+            )
+            .count()
+        )
+        if other_active_admins == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot delete the last active administrator account.",
+            )
+
+    db.delete(user)
+    db.commit()
+    return None
+
+
+@app.get("/api/users/{user_id}/api-keys", response_model=List[UserAPIKeyRead])
+def list_user_api_keys(
+    user_id: int,
+    db: Session = Depends(get_db),
+    _admin: AuthPrincipal = Depends(require_admin),
+):
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    return (
+        db.query(UserAPIKey)
+        .filter(UserAPIKey.user_id == user.id)
+        .order_by(UserAPIKey.created_at.desc())
+        .all()
+    )
+
+
+@app.post(
+    "/api/users/{user_id}/api-keys",
+    response_model=UserAPIKeyCreatedResponse,
+    status_code=201,
+)
+def create_user_api_key(
+    user_id: int,
+    payload: UserAPIKeyCreate,
+    db: Session = Depends(get_db),
+    _admin: AuthPrincipal = Depends(require_admin),
+):
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    return _create_api_key_for_user(db, user, payload)
+
+
+@app.delete("/api/users/{user_id}/api-keys/{key_id}", status_code=204)
+def revoke_user_api_key(
+    user_id: int,
+    key_id: int,
+    db: Session = Depends(get_db),
+    _admin: AuthPrincipal = Depends(require_admin),
+):
+    key_row = (
+        db.query(UserAPIKey)
+        .filter(UserAPIKey.id == key_id, UserAPIKey.user_id == user_id)
+        .first()
+    )
+    if not key_row:
+        raise HTTPException(status_code=404, detail="API key not found for this user.")
+    db.delete(key_row)
+    db.commit()
+    return None
 
 
 # ==========================================
@@ -597,7 +936,7 @@ def get_subnet(
 async def create_subnet(
     payload: SubnetCreate,
     db: Session = Depends(get_db),
-    _admin: AuthPrincipal = Depends(require_admin),
+    admin: AuthPrincipal = Depends(require_admin),
 ):
     site = db.query(Site).filter(Site.id == payload.site_id).first()
     if not site:
@@ -634,7 +973,7 @@ async def create_subnet(
     db.refresh(subnet)
 
     populate_subnet_ip_records(db, subnet)
-    scanner_worker.schedule_immediate_scan(subnet.id)
+    scanner_worker.schedule_immediate_scan(subnet.id, actor_username=admin.username)
     return subnet
 
 
@@ -643,7 +982,7 @@ def update_subnet(
     subnet_id: int,
     payload: SubnetUpdate,
     db: Session = Depends(get_db),
-    _admin: AuthPrincipal = Depends(require_admin),
+    admin: AuthPrincipal = Depends(require_admin),
 ):
     subnet = db.query(SubnetScope).filter(SubnetScope.id == subnet_id).first()
     if not subnet:
@@ -678,7 +1017,7 @@ def update_subnet(
     db.refresh(subnet)
 
     if subnet.scan_enabled and subnet.last_scanned_at is None:
-        scanner_worker.schedule_immediate_scan(subnet.id)
+        scanner_worker.schedule_immediate_scan(subnet.id, actor_username=admin.username)
 
     return subnet
 
@@ -698,25 +1037,66 @@ def delete_subnet(
     return None
 
 
+def _select_subnet_anchor_ip(db: Session, subnet: SubnetScope) -> Optional[IPRecord]:
+    """
+    Returns the gateway IPRecord (or first IPRecord in the subnet) for attaching
+    subnet-level operator audit events (manual scan triggers and history resets).
+    """
+    if subnet.gateway_ip:
+        gw_rec = (
+            db.query(IPRecord)
+            .filter(
+                IPRecord.subnet_id == subnet.id,
+                IPRecord.ip_address == subnet.gateway_ip,
+            )
+            .first()
+        )
+        if gw_rec is not None:
+            return gw_rec
+    return (
+        db.query(IPRecord)
+        .filter(IPRecord.subnet_id == subnet.id)
+        .order_by(IPRecord.ip_integer.asc())
+        .first()
+    )
+
+
 @app.post("/api/subnets/{subnet_id}/scan", response_model=SubnetSummaryRead)
 async def trigger_manual_subnet_scan(
     subnet_id: int,
     db: Session = Depends(get_db),
-    _admin: AuthPrincipal = Depends(require_admin),
+    admin: AuthPrincipal = Depends(require_admin),
 ):
     """
     Immediate 'Rescan Now' endpoint at the subnet level. Launches an asynchronous
-    non-blocking sweep of the subnet's IP range.
+    non-blocking sweep of the subnet's IP range and logs operator attribution.
     """
     subnet = db.query(SubnetScope).filter(SubnetScope.id == subnet_id).first()
     if not subnet:
         raise HTTPException(status_code=404, detail="Subnet not found.")
 
+    anchor_ip = _select_subnet_anchor_ip(db, subnet)
+    if anchor_ip is not None:
+        db.add(
+            AuditEventLog(
+                ip_record_id=anchor_ip.id,
+                previous_status=None,
+                new_status=None,
+                event_type="MANUAL_SCAN_TRIGGER",
+                actor_username=admin.username,
+                response_time_ms=None,
+                details=f"Manual subnet sweep triggered for {subnet.cidr} by {admin.username}",
+            )
+        )
+
     if subnet.id not in scanner_worker.active_subnet_scans:
         subnet.scan_status = ScanStatus.SCANNING
         db.commit()
         db.refresh(subnet)
-        scanner_worker.schedule_immediate_scan(subnet.id)
+        scanner_worker.schedule_immediate_scan(subnet.id, actor_username=admin.username)
+    else:
+        db.commit()
+        db.refresh(subnet)
 
     return subnet
 
@@ -725,17 +1105,22 @@ async def trigger_manual_subnet_scan(
 def clear_subnet_history(
     subnet_id: int,
     db: Session = Depends(get_db),
-    _admin: AuthPrincipal = Depends(require_admin),
+    admin: AuthPrincipal = Depends(require_admin),
 ):
     """
-    Clears all state transition / audit event logs for every IP record in the subnet
-    and resets historical timestamps and sweep counters.
+    Clears all state transition / audit event logs for every IP record in the subnet,
+    resets historical timestamps and sweep counters, and records operator attribution.
     """
     subnet = db.query(SubnetScope).filter(SubnetScope.id == subnet_id).first()
     if not subnet:
         raise HTTPException(status_code=404, detail="Subnet not found.")
 
-    ip_records = db.query(IPRecord).filter(IPRecord.subnet_id == subnet_id).all()
+    ip_records = (
+        db.query(IPRecord)
+        .filter(IPRecord.subnet_id == subnet_id)
+        .order_by(IPRecord.ip_integer.asc())
+        .all()
+    )
     ip_ids = [rec.id for rec in ip_records]
 
     if ip_ids:
@@ -751,6 +1136,20 @@ def clear_subnet_history(
         rec.last_checked_at = None
         rec.consecutive_offline_scans = 0
         rec.state_change_count = 0
+
+    anchor_ip = _select_subnet_anchor_ip(db, subnet)
+    if anchor_ip is not None:
+        db.add(
+            AuditEventLog(
+                ip_record_id=anchor_ip.id,
+                previous_status=None,
+                new_status=None,
+                event_type="HISTORY_RESET",
+                actor_username=admin.username,
+                response_time_ms=None,
+                details=f"Subnet scan and audit history cleared for {subnet.cidr} by {admin.username}",
+            )
+        )
 
     subnet.online_count = 0
     subnet.offline_count = 0
@@ -774,6 +1173,7 @@ def _execute_bulk_import(
     items: List[BulkSubnetImportItem],
     trigger_initial_scan: bool,
     db: Session,
+    actor_username: Optional[str] = None,
 ) -> BulkSubnetImportResult:
     # 1. Pre-flight validation for intra-batch and database CIDR overlap before mutating state
     accepted_batch_cidrs: List[tuple[str, str]] = []
@@ -846,7 +1246,7 @@ def _execute_bulk_import(
         imported_subnet_ids.append(new_subnet.id)
 
         if trigger_initial_scan:
-            scanner_worker.schedule_immediate_scan(new_subnet.id)
+            scanner_worker.schedule_immediate_scan(new_subnet.id, actor_username=actor_username)
 
     return BulkSubnetImportResult(
         created_sites=created_sites,
@@ -860,14 +1260,19 @@ def _execute_bulk_import(
 async def bulk_import_subnets_json(
     payload: BulkSubnetImportRequest,
     db: Session = Depends(get_db),
-    _admin: AuthPrincipal = Depends(require_admin),
+    admin: AuthPrincipal = Depends(require_admin),
 ):
     """
     Bulk-imports sites, subnet CIDR scopes, and scan intervals from structured JSON.
     """
     if not payload.subnets:
         raise HTTPException(status_code=400, detail="No subnet entries provided for import.")
-    return _execute_bulk_import(payload.subnets, payload.trigger_initial_scan, db)
+    return _execute_bulk_import(
+        payload.subnets,
+        payload.trigger_initial_scan,
+        db,
+        actor_username=admin.username,
+    )
 
 
 @app.post("/api/subnets/bulk-import-csv", response_model=BulkSubnetImportResult, status_code=201)
@@ -875,7 +1280,7 @@ async def bulk_import_subnets_csv(
     file: UploadFile = File(...),
     trigger_initial_scan: bool = Query(False),
     db: Session = Depends(get_db),
-    _admin: AuthPrincipal = Depends(require_admin),
+    admin: AuthPrincipal = Depends(require_admin),
 ):
     """
     Bulk-imports subnets from an uploaded CSV file with columns:
@@ -918,7 +1323,7 @@ async def bulk_import_subnets_csv(
             detail="No valid subnet rows found in CSV. Required columns: site_name, cidr, label.",
         )
 
-    return _execute_bulk_import(items, trigger_initial_scan, db)
+    return _execute_bulk_import(items, trigger_initial_scan, db, actor_username=admin.username)
 
 
 # ==========================================
@@ -978,7 +1383,7 @@ def update_ip_record_audit(
     ip_id: int,
     payload: IPRecordUpdate,
     db: Session = Depends(get_db),
-    _admin: AuthPrincipal = Depends(require_admin),
+    admin: AuthPrincipal = Depends(require_admin),
 ):
     ip_record = (
         db.query(IPRecord)
@@ -1016,6 +1421,7 @@ def update_ip_record_audit(
             previous_status=None,
             new_status=None,
             event_type="MANUAL_AUDIT_UPDATE",
+            actor_username=admin.username,
             response_time_ms=None,
             details="; ".join(changes),
         )

@@ -147,14 +147,16 @@ class SubnetScannerWorker:
         """
         self._last_cron_trigger_date.pop(subnet_id, None)
 
-    def _create_scan_task(self, subnet_id: int) -> None:
+    def _create_scan_task(self, subnet_id: int, actor_username: Optional[str] = None) -> None:
         if subnet_id in self.active_subnet_scans:
             return
-        task = asyncio.create_task(self.scan_subnet(subnet_id))
+        task = asyncio.create_task(self.scan_subnet(subnet_id, actor_username=actor_username))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
-    def schedule_immediate_scan(self, subnet_id: int) -> None:
+    def schedule_immediate_scan(
+        self, subnet_id: int, actor_username: Optional[str] = None
+    ) -> None:
         """
         Schedules an immediate non-blocking subnet scan task safely from either
         an async coroutine or a synchronous worker thread.
@@ -164,19 +166,21 @@ class SubnetScannerWorker:
         try:
             running_loop = asyncio.get_running_loop()
             if running_loop.is_running():
-                self._create_scan_task(subnet_id)
+                self._create_scan_task(subnet_id, actor_username=actor_username)
                 return
         except RuntimeError:
             pass
 
         if self._loop and self._loop.is_running():
-            self._loop.call_soon_threadsafe(self._create_scan_task, subnet_id)
+            self._loop.call_soon_threadsafe(self._create_scan_task, subnet_id, actor_username)
 
-    async def trigger_subnet_scan(self, subnet_id: int) -> None:
+    async def trigger_subnet_scan(
+        self, subnet_id: int, actor_username: Optional[str] = None
+    ) -> None:
         """
         Entrypoint compatible with FastAPI BackgroundTasks.
         """
-        await self.scan_subnet(subnet_id)
+        await self.scan_subnet(subnet_id, actor_username=actor_username)
 
     async def _probe_single_ip(
         self, ip_id: int, ip_address: str, existing_hostname: Optional[str]
@@ -188,7 +192,9 @@ class SubnetScannerWorker:
                 resolved_hostname = await async_reverse_dns(ip_address)
             return ip_id, is_online, rtt_ms, resolved_hostname
 
-    async def scan_subnet(self, subnet_id: int) -> None:
+    async def scan_subnet(
+        self, subnet_id: int, actor_username: Optional[str] = None
+    ) -> None:
         """
         Sweeps all IP records belonging to a SubnetScope concurrently, records state
         transitions in AuditEventLog, and updates subnet utilization counters.
@@ -234,7 +240,14 @@ class SubnetScannerWorker:
             duration_ms = int(round((time.perf_counter() - sweep_start) * 1000.0))
 
             with SessionLocal() as db:
-                self._reconcile_scan_results(db, subnet_id, result_map, now_utc, duration_ms)
+                self._reconcile_scan_results(
+                    db,
+                    subnet_id,
+                    result_map,
+                    now_utc,
+                    duration_ms,
+                    actor_username=actor_username,
+                )
 
             logger.info("Completed sweep for subnet %s in %d ms.", subnet_cidr, duration_ms)
 
@@ -255,6 +268,7 @@ class SubnetScannerWorker:
         result_map: Dict[int, Tuple[bool, Optional[float], Optional[str]]],
         now_utc: datetime,
         duration_ms: int,
+        actor_username: Optional[str] = None,
     ) -> None:
         subnet = db.query(SubnetScope).filter(SubnetScope.id == subnet_id).first()
         if not subnet:
@@ -299,6 +313,7 @@ class SubnetScannerWorker:
                             previous_status=previous_status if status_changed else None,
                             new_status=new_status if status_changed else None,
                             event_type="GHOST_DEVICE_DETECTED",
+                            actor_username=actor_username,
                             response_time_ms=rtt_ms,
                             details=(
                                 f"Host marked Expected Decommissioned responded to ICMP ping ({rtt_ms} ms); "
@@ -324,6 +339,7 @@ class SubnetScannerWorker:
                             previous_status=previous_status if status_changed else None,
                             new_status=new_status if status_changed else None,
                             event_type="AUTO_FLAG_SUSPECTED_UNUSED",
+                            actor_username=actor_username,
                             response_time_ms=None,
                             details=(
                                 f"IPAM-allocated host offline for {record.consecutive_offline_scans} "
@@ -347,6 +363,7 @@ class SubnetScannerWorker:
                         previous_status=previous_status,
                         new_status=new_status,
                         event_type="STATE_TRANSITION",
+                        actor_username=actor_username,
                         response_time_ms=rtt_ms,
                         details=transition_detail,
                         timestamp=now_utc,
@@ -436,7 +453,7 @@ class SubnetScannerWorker:
                     due_subnet_ids = self.evaluate_due_subnets(db, now_utc)
 
                 for subnet_id in due_subnet_ids:
-                    self.schedule_immediate_scan(subnet_id)
+                    self.schedule_immediate_scan(subnet_id, actor_username="system")
 
             except asyncio.CancelledError:
                 break

@@ -58,6 +58,57 @@ class ScanStatus(str, enum.Enum):
     FAILED = "Failed"
 
 
+class UserRole(str, enum.Enum):
+    ADMIN = "admin"
+    VIEWER = "viewer"
+
+
+class User(Base):
+    """
+    Operator user account stored in SQLite with salted PBKDF2 password hash
+    and role-based access control (admin / viewer).
+    """
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    username: Mapped[str] = mapped_column(String(120), unique=True, nullable=False, index=True)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    role: Mapped[UserRole] = mapped_column(
+        Enum(UserRole), default=UserRole.VIEWER, nullable=False, index=True
+    )
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    last_login_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    api_keys: Mapped[List["UserAPIKey"]] = relationship(
+        "UserAPIKey",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        order_by="UserAPIKey.created_at.desc()",
+    )
+
+
+class UserAPIKey(Base):
+    """
+    Per-user scoped API key with SHA-256 digest storage and optional expiration timestamp.
+    """
+    __tablename__ = "user_api_keys"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    key_prefix: Mapped[str] = mapped_column(String(24), nullable=False, index=True)
+    key_hash: Mapped[str] = mapped_column(String(128), unique=True, nullable=False, index=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    user: Mapped["User"] = relationship("User", back_populates="api_keys")
+
+
 class Site(Base):
     """
     1. Site / Location (Top Level) -> Has many Subnets.
@@ -243,6 +294,7 @@ class AuditEventLog(Base):
     event_type: Mapped[str] = mapped_column(
         String(64), nullable=False, default="STATE_TRANSITION"
     )
+    actor_username: Mapped[Optional[str]] = mapped_column(String(120), nullable=True, index=True)
     response_time_ms: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     details: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     timestamp: Mapped[datetime] = mapped_column(

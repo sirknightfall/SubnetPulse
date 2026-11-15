@@ -14,6 +14,7 @@ import {
   FileText,
   Filter,
   History,
+  Key,
   Layers,
   Network,
   Plus,
@@ -23,6 +24,7 @@ import {
   ShieldAlert,
   Trash2,
   Upload,
+  Users,
   Wifi,
   WifiOff,
   X
@@ -152,6 +154,8 @@ export default function App() {
   const [bulkModalInitialTab, setBulkModalInitialTab] = useState("json");
   const [bulkModalInitialSite, setBulkModalInitialSite] = useState("");
   const [showScheduleModal, setShowScheduleModal] = useState(false);
+  const [showChangePasswordModal, setShowChangePasswordModal] = useState(false);
+  const [showAdminUsersModal, setShowAdminUsersModal] = useState(false);
 
   // Unused / Orphaned Report State
   const [reportItems, setReportItems] = useState([]);
@@ -559,13 +563,33 @@ export default function App() {
           </button>
 
           {authUser ? (
-            <div className="flex items-center gap-2 pl-2 border-l border-slate-800">
-              <span className="text-xs text-slate-300 font-mono">
+            <div className="flex items-center gap-1.5 pl-2 border-l border-slate-800">
+              <span className="text-xs text-slate-300 font-mono mr-1">
                 {authUser.username}{" "}
                 <span className="px-1.5 py-0.5 rounded text-[10px] uppercase bg-sky-500/15 text-sky-300 border border-sky-500/30">
                   {authUser.role}
                 </span>
               </span>
+              {authUser.role === "admin" && (
+                <button
+                  type="button"
+                  onClick={() => setShowAdminUsersModal(true)}
+                  title="Manage operator accounts, roles & API keys"
+                  className="px-2.5 py-1 rounded-lg text-xs bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-800 transition flex items-center gap-1"
+                >
+                  <Users className="w-3.5 h-3.5 text-sky-400" />
+                  <span>Users</span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setShowChangePasswordModal(true)}
+                title="Change password & manage personal API keys"
+                className="px-2.5 py-1 rounded-lg text-xs bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-800 transition flex items-center gap-1"
+              >
+                <Key className="w-3.5 h-3.5 text-amber-400" />
+                <span>Password &amp; Keys</span>
+              </button>
               <button
                 type="button"
                 onClick={async () => {
@@ -1243,6 +1267,24 @@ export default function App() {
           }}
         />
       )}
+
+      {/* MODAL 6: Self-Service Password Rotation & Personal API Keys */}
+      {showChangePasswordModal && authUser && (
+        <ChangePasswordModal
+          authUser={authUser}
+          onClose={() => setShowChangePasswordModal(false)}
+          onNotify={(msg, type = "success") => showToast(msg, type)}
+        />
+      )}
+
+      {/* MODAL 7: Admin Multi-User & Scoped API Key Management */}
+      {showAdminUsersModal && authUser?.role === "admin" && (
+        <AdminUsersModal
+          currentUsername={authUser.username}
+          onClose={() => setShowAdminUsersModal(false)}
+          onNotify={(msg, type = "success") => showToast(msg, type)}
+        />
+      )}
     </div>
   );
 }
@@ -1449,6 +1491,11 @@ function AuditHistoryModal({ ipDetail, onClose }) {
                     <span className="font-mono text-[10px] uppercase px-2 py-0.5 rounded bg-slate-800 text-sky-300 border border-slate-700">
                       {log.event_type}
                     </span>
+                    {log.actor_username && (
+                      <span className="font-mono text-[10px] px-2 py-0.5 rounded bg-indigo-500/15 text-indigo-300 border border-indigo-500/30">
+                        by {log.actor_username}
+                      </span>
+                    )}
                     {log.previous_status &&
                       log.new_status &&
                       log.previous_status !== log.new_status && (
@@ -2120,6 +2167,804 @@ function AuthLoginModal({ onAuthenticated }) {
           </button>
         </div>
       </form>
+    </div>
+  );
+}
+
+/* ============================================================================
+ * Modal: Self-Service Password Rotation & Scoped Personal API Keys
+ * ============================================================================ */
+function ChangePasswordModal({ authUser, onClose, onNotify }) {
+  const [tab, setTab] = useState("password"); // "password" | "apikeys"
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState(null);
+
+  // Scoped API Keys State
+  const [keys, setKeys] = useState([]);
+  const [keysLoading, setKeysLoading] = useState(false);
+  const [keyName, setKeyName] = useState("");
+  const [expiresInDays, setExpiresInDays] = useState("");
+  const [newlyCreatedKey, setNewlyCreatedKey] = useState(null);
+
+  const loadMyKeys = useCallback(async () => {
+    try {
+      setKeysLoading(true);
+      const data = await api.getMyApiKeys();
+      setKeys(data);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setKeysLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (tab === "apikeys") {
+      loadMyKeys();
+    }
+  }, [tab, loadMyKeys]);
+
+  const handlePasswordSubmit = async (e) => {
+    e.preventDefault();
+    setError(null);
+    if (newPassword.length < 6) {
+      setError("New password must be at least 6 characters long.");
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      setError("New password and confirmation do not match.");
+      return;
+    }
+    setSaving(true);
+    try {
+      await api.changePassword({
+        current_password: currentPassword,
+        new_password: newPassword
+      });
+      onNotify("Password updated.", "success");
+      onClose();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleCreateKey = async (e) => {
+    e.preventDefault();
+    setError(null);
+    if (!keyName.trim()) {
+      setError("Provide a descriptive name for the API key.");
+      return;
+    }
+    setSaving(true);
+    try {
+      const payload = {
+        name: keyName.trim(),
+        expires_in_days: expiresInDays ? Number(expiresInDays) : null
+      };
+      const created = await api.createMyApiKey(payload);
+      setNewlyCreatedKey(created);
+      setKeyName("");
+      setExpiresInDays("");
+      await loadMyKeys();
+      onNotify(`Generated API key '${created.name}'.`, "success");
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleRevokeKey = async (keyItem) => {
+    setError(null);
+    try {
+      await api.revokeMyApiKey(keyItem.id);
+      if (newlyCreatedKey?.id === keyItem.id) {
+        setNewlyCreatedKey(null);
+      }
+      await loadMyKeys();
+      onNotify(`Revoked API key '${keyItem.name}'.`, "info");
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-sm flex items-center justify-center p-4">
+      <div className="w-full max-w-lg rounded-xl border border-slate-800 bg-slate-900 shadow-2xl overflow-hidden flex flex-col max-h-[86vh]">
+        <div className="px-5 py-4 border-b border-slate-800 flex items-center justify-between">
+          <div className="flex items-center gap-2.5">
+            <Key className="w-4 h-4 text-amber-400" />
+            <div>
+              <h2 className="text-sm font-bold text-white">
+                Security &amp; Scoped API Keys — {authUser.username}
+              </h2>
+              <p className="text-[11px] text-slate-400">
+                Rotate your password or manage personal API keys ({authUser.role} scope).
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="text-slate-400 hover:text-white"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        <div className="px-5 pt-2 border-b border-slate-800 flex gap-2 text-xs">
+          {[
+            { id: "password", label: "Change Password" },
+            { id: "apikeys", label: "Scoped API Keys" }
+          ].map((t) => (
+            <button
+              key={t.id}
+              type="button"
+              onClick={() => {
+                setError(null);
+                setTab(t.id);
+              }}
+              className={`px-3 py-2 border-b-2 font-medium transition ${
+                tab === t.id
+                  ? "border-amber-400 text-amber-300"
+                  : "border-transparent text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+
+        {error && (
+          <div className="mx-5 mt-4 p-2.5 rounded-lg bg-rose-950/90 border border-rose-800 text-xs text-rose-200">
+            {error}
+          </div>
+        )}
+
+        {tab === "password" ? (
+          <form onSubmit={handlePasswordSubmit} className="p-5 space-y-3 text-xs">
+            <div>
+              <label className="block text-slate-400 mb-1">Current Password</label>
+              <input
+                type="password"
+                required
+                value={currentPassword}
+                onChange={(e) => setCurrentPassword(e.target.value)}
+                placeholder="Enter current password"
+                className="w-full px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-slate-100"
+              />
+            </div>
+
+            <div>
+              <label className="block text-slate-400 mb-1">
+                New Password (min. 6 characters)
+              </label>
+              <input
+                type="password"
+                required
+                minLength={6}
+                value={newPassword}
+                onChange={(e) => setNewPassword(e.target.value)}
+                placeholder="Enter new password"
+                className="w-full px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-slate-100"
+              />
+            </div>
+
+            <div>
+              <label className="block text-slate-400 mb-1">
+                Confirm New Password
+              </label>
+              <input
+                type="password"
+                required
+                minLength={6}
+                value={confirmPassword}
+                onChange={(e) => setConfirmPassword(e.target.value)}
+                placeholder="Repeat new password"
+                className="w-full px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-slate-100"
+              />
+            </div>
+
+            <div className="pt-2 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={onClose}
+                className="px-3 py-1.5 rounded-lg bg-slate-800 text-slate-300"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={saving}
+                className="px-4 py-1.5 rounded-lg font-semibold bg-amber-500 hover:bg-amber-400 text-slate-950 transition"
+              >
+                {saving ? "Updating..." : "Update Password"}
+              </button>
+            </div>
+          </form>
+        ) : (
+          <div className="p-5 space-y-4 text-xs overflow-y-auto">
+            {newlyCreatedKey && (
+              <div className="p-3 rounded-lg bg-emerald-950/80 border border-emerald-700/80 space-y-1.5">
+                <div className="font-semibold text-emerald-300">
+                  New API Key Generated — Copy Now (shown only once):
+                </div>
+                <div className="flex items-center gap-2">
+                  <code className="flex-1 px-2.5 py-1.5 rounded bg-slate-950 border border-emerald-800 font-mono text-emerald-200 select-all break-all">
+                    {newlyCreatedKey.api_key}
+                  </code>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      navigator.clipboard?.writeText(newlyCreatedKey.api_key);
+                      onNotify("API key copied to clipboard.", "info");
+                    }}
+                    className="px-2.5 py-1.5 rounded bg-emerald-500 text-slate-950 font-semibold shrink-0"
+                  >
+                    Copy
+                  </button>
+                </div>
+              </div>
+            )}
+
+            <form
+              onSubmit={handleCreateKey}
+              className="p-3 rounded-lg bg-slate-950/70 border border-slate-800 space-y-2.5"
+            >
+              <div className="font-semibold text-slate-200">
+                Generate New Scoped API Key
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                <input
+                  type="text"
+                  required
+                  value={keyName}
+                  onChange={(e) => setKeyName(e.target.value)}
+                  placeholder="Key label (e.g. Ansible Runner)"
+                  className="sm:col-span-2 px-2.5 py-1.5 rounded bg-slate-900 border border-slate-800 text-slate-100"
+                />
+                <select
+                  value={expiresInDays}
+                  onChange={(e) => setExpiresInDays(e.target.value)}
+                  className="px-2.5 py-1.5 rounded bg-slate-900 border border-slate-800 text-slate-200"
+                >
+                  <option value="">No Expiration</option>
+                  <option value="7">Expires in 7d</option>
+                  <option value="30">Expires in 30d</option>
+                  <option value="90">Expires in 90d</option>
+                  <option value="365">Expires in 1y</option>
+                </select>
+              </div>
+              <div className="flex justify-end">
+                <button
+                  type="submit"
+                  disabled={saving}
+                  className="px-3 py-1.5 rounded-lg font-semibold bg-sky-500 hover:bg-sky-400 text-slate-950 flex items-center gap-1"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>Generate Key</span>
+                </button>
+              </div>
+            </form>
+
+            <div className="space-y-2">
+              <div className="font-semibold text-slate-300">
+                Active API Keys ({keys.length})
+              </div>
+              {keysLoading ? (
+                <div className="py-4 text-center text-slate-500">
+                  Loading API keys...
+                </div>
+              ) : keys.length === 0 ? (
+                <div className="py-4 text-center text-slate-500">
+                  No personal API keys configured.
+                </div>
+              ) : (
+                keys.map((k) => (
+                  <div
+                    key={k.id}
+                    className="p-2.5 rounded-lg border border-slate-800 bg-slate-950/60 flex items-center justify-between gap-3"
+                  >
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className="font-semibold text-slate-100">
+                          {k.name}
+                        </span>
+                        <span className="font-mono text-[11px] px-1.5 py-0.5 rounded bg-slate-900 text-sky-300 border border-slate-800">
+                          {k.key_prefix}...
+                        </span>
+                      </div>
+                      <div className="text-[11px] text-slate-400 mt-0.5">
+                        Created: {formatTimestamp(k.created_at)} •{" "}
+                        {k.expires_at
+                          ? `Expires: ${formatTimestamp(k.expires_at)}`
+                          : "Never expires"}{" "}
+                        • Last used: {formatTimestamp(k.last_used_at)}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => handleRevokeKey(k)}
+                      className="px-2.5 py-1 rounded bg-rose-500/15 hover:bg-rose-500/25 text-rose-300 border border-rose-500/30 text-[11px]"
+                    >
+                      Revoke
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================================
+ * Modal: Admin Multi-User & Scoped API Key Management
+ * ============================================================================ */
+function AdminUsersModal({ currentUsername, onClose, onNotify }) {
+  const [users, setUsers] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  // New user form
+  const [newUsername, setNewUsername] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [newRole, setNewRole] = useState("viewer");
+  const [creating, setCreating] = useState(false);
+
+  // Per-user inline password reset & API key drawer
+  const [resetUserId, setResetUserId] = useState(null);
+  const [resetPasswordVal, setResetPasswordVal] = useState("");
+  const [expandedKeyUserId, setExpandedKeyUserId] = useState(null);
+  const [newKeyName, setNewKeyName] = useState("");
+  const [newKeyDays, setNewKeyDays] = useState("");
+  const [generatedKeyBanner, setGeneratedKeyBanner] = useState(null);
+
+  const loadUsers = useCallback(async () => {
+    try {
+      setLoading(true);
+      const data = await api.getUsers();
+      setUsers(data);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadUsers();
+  }, [loadUsers]);
+
+  const handleCreateUser = async (e) => {
+    e.preventDefault();
+    setError(null);
+    setCreating(true);
+    try {
+      const created = await api.createUser({
+        username: newUsername.trim(),
+        password: newPassword,
+        role: newRole,
+        is_active: true
+      });
+      setNewUsername("");
+      setNewPassword("");
+      setNewRole("viewer");
+      await loadUsers();
+      onNotify(`Created user '${created.username}' (${created.role}).`, "success");
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const handleToggleRole = async (u) => {
+    setError(null);
+    const nextRole = u.role === "admin" ? "viewer" : "admin";
+    try {
+      await api.updateUser(u.id, { role: nextRole });
+      await loadUsers();
+      onNotify(`Updated '${u.username}' role to ${nextRole}.`, "success");
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
+  const handleToggleActive = async (u) => {
+    setError(null);
+    const nextActive = !u.is_active;
+    try {
+      await api.updateUser(u.id, { is_active: nextActive });
+      await loadUsers();
+      onNotify(
+        `Account '${u.username}' ${nextActive ? "enabled" : "disabled"}.`,
+        "info"
+      );
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
+  const handleResetUserPassword = async (u) => {
+    setError(null);
+    if (!resetPasswordVal || resetPasswordVal.length < 6) {
+      setError("Password must be at least 6 characters long.");
+      return;
+    }
+    try {
+      await api.updateUser(u.id, { password: resetPasswordVal });
+      setResetUserId(null);
+      setResetPasswordVal("");
+      onNotify(`Reset password for '${u.username}'.`, "success");
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
+  const handleDeleteUser = async (u) => {
+    setError(null);
+    if (!window.confirm(`Delete user '${u.username}' and revoke all their API keys?`)) {
+      return;
+    }
+    try {
+      await api.deleteUser(u.id);
+      await loadUsers();
+      onNotify(`Deleted user '${u.username}'.`, "info");
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
+  const handleCreateUserKey = async (u) => {
+    setError(null);
+    if (!newKeyName.trim()) {
+      setError("Enter a key name before generating.");
+      return;
+    }
+    try {
+      const created = await api.createUserApiKey(u.id, {
+        name: newKeyName.trim(),
+        expires_in_days: newKeyDays ? Number(newKeyDays) : null
+      });
+      setGeneratedKeyBanner({
+        username: u.username,
+        name: created.name,
+        api_key: created.api_key
+      });
+      setNewKeyName("");
+      setNewKeyDays("");
+      await loadUsers();
+      onNotify(`Generated API key '${created.name}' for ${u.username}.`, "success");
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
+  const handleRevokeUserKey = async (u, keyId) => {
+    setError(null);
+    try {
+      await api.revokeUserApiKey(u.id, keyId);
+      await loadUsers();
+      onNotify(`Revoked API key for '${u.username}'.`, "info");
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-sm flex items-center justify-center p-4">
+      <div className="w-full max-w-3xl rounded-xl border border-slate-800 bg-slate-900 shadow-2xl overflow-hidden flex flex-col max-h-[88vh]">
+        <div className="px-5 py-4 border-b border-slate-800 flex items-center justify-between">
+          <div className="flex items-center gap-2.5">
+            <Users className="w-4 h-4 text-sky-400" />
+            <div>
+              <h2 className="text-sm font-bold text-white">
+                Operator Accounts &amp; Role Management
+              </h2>
+              <p className="text-[11px] text-slate-400">
+                Add or disable accounts, assign admin/viewer roles, rotate passwords, and issue per-user API keys.
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="text-slate-400 hover:text-white"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        <div className="p-5 overflow-y-auto space-y-4 text-xs">
+          {error && (
+            <div className="p-2.5 rounded-lg bg-rose-950/90 border border-rose-800 text-rose-200">
+              {error}
+            </div>
+          )}
+
+          {generatedKeyBanner && (
+            <div className="p-3 rounded-lg bg-emerald-950/80 border border-emerald-700/80 space-y-1.5">
+              <div className="flex items-center justify-between">
+                <span className="font-semibold text-emerald-300">
+                  API Key for {generatedKeyBanner.username} ({generatedKeyBanner.name}) — Copy Now:
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setGeneratedKeyBanner(null)}
+                  className="text-slate-400 hover:text-white"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+              <div className="flex items-center gap-2">
+                <code className="flex-1 px-2.5 py-1.5 rounded bg-slate-950 border border-emerald-800 font-mono text-emerald-200 select-all break-all">
+                  {generatedKeyBanner.api_key}
+                </code>
+                <button
+                  type="button"
+                  onClick={() => {
+                    navigator.clipboard?.writeText(generatedKeyBanner.api_key);
+                    onNotify("API key copied to clipboard.", "info");
+                  }}
+                  className="px-2.5 py-1.5 rounded bg-emerald-500 text-slate-950 font-semibold shrink-0"
+                >
+                  Copy
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Create New User Form */}
+          <form
+            onSubmit={handleCreateUser}
+            className="p-3.5 rounded-xl bg-slate-950/70 border border-slate-800 space-y-2.5"
+          >
+            <div className="font-semibold text-slate-200 flex items-center gap-1.5">
+              <Plus className="w-3.5 h-3.5 text-sky-400" />
+              <span>Create Operator Account</span>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-4 gap-2">
+              <input
+                type="text"
+                required
+                value={newUsername}
+                onChange={(e) => setNewUsername(e.target.value)}
+                placeholder="Username (e.g. netops_jane)"
+                className="px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-100"
+              />
+              <input
+                type="password"
+                required
+                minLength={6}
+                value={newPassword}
+                onChange={(e) => setNewPassword(e.target.value)}
+                placeholder="Initial password (min 6 chars)"
+                className="px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-100"
+              />
+              <select
+                value={newRole}
+                onChange={(e) => setNewRole(e.target.value)}
+                className="px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-200"
+              >
+                <option value="viewer">Viewer (Read-Only Auditor)</option>
+                <option value="admin">Admin (Full Scan &amp; CRUD)</option>
+              </select>
+              <button
+                type="submit"
+                disabled={creating}
+                className="px-3 py-1.5 rounded-lg font-semibold bg-sky-500 hover:bg-sky-400 text-slate-950 transition"
+              >
+                {creating ? "Creating..." : "Add User"}
+              </button>
+            </div>
+          </form>
+
+          {/* Users Table / Cards */}
+          <div className="space-y-2.5">
+            {loading ? (
+              <div className="py-8 text-center text-slate-400">
+                Loading operator accounts...
+              </div>
+            ) : (
+              users.map((u) => {
+                const isSelf =
+                  u.username.toLowerCase() === currentUsername.toLowerCase();
+                const showKeys = expandedKeyUserId === u.id;
+                const showReset = resetUserId === u.id;
+
+                return (
+                  <div
+                    key={u.id}
+                    className="p-3.5 rounded-xl border border-slate-800 bg-slate-950/60 space-y-2.5"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <span className="font-mono font-bold text-slate-100 text-sm">
+                          {u.username}
+                        </span>
+                        {isSelf && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700">
+                            You
+                          </span>
+                        )}
+                        <span
+                          className={`text-[10px] font-mono uppercase px-2 py-0.5 rounded border ${
+                            u.role === "admin"
+                              ? "bg-sky-500/15 text-sky-300 border-sky-500/30"
+                              : "bg-indigo-500/15 text-indigo-300 border-indigo-500/30"
+                          }`}
+                        >
+                          {u.role}
+                        </span>
+                        <span
+                          className={`text-[10px] px-2 py-0.5 rounded border ${
+                            u.is_active
+                              ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/30"
+                              : "bg-rose-500/15 text-rose-300 border-rose-500/30"
+                          }`}
+                        >
+                          {u.is_active ? "Active" : "Disabled"}
+                        </span>
+                        <span className="text-[11px] text-slate-400">
+                          • Last login: {formatTimestamp(u.last_login_at)}
+                        </span>
+                      </div>
+
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          disabled={isSelf}
+                          onClick={() => handleToggleRole(u)}
+                          title={
+                            isSelf
+                              ? "Cannot change your own role"
+                              : "Switch between admin and viewer role"
+                          }
+                          className="px-2 py-1 rounded bg-slate-900 hover:bg-slate-800 disabled:opacity-40 text-slate-200 border border-slate-800"
+                        >
+                          Make {u.role === "admin" ? "Viewer" : "Admin"}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={isSelf}
+                          onClick={() => handleToggleActive(u)}
+                          className="px-2 py-1 rounded bg-slate-900 hover:bg-slate-800 disabled:opacity-40 text-slate-200 border border-slate-800"
+                        >
+                          {u.is_active ? "Disable" : "Enable"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setResetUserId(showReset ? null : u.id);
+                            setResetPasswordVal("");
+                          }}
+                          className="px-2 py-1 rounded bg-slate-900 hover:bg-slate-800 text-amber-300 border border-slate-800"
+                        >
+                          Reset Password
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setExpandedKeyUserId(showKeys ? null : u.id)
+                          }
+                          className="px-2 py-1 rounded bg-slate-900 hover:bg-slate-800 text-sky-300 border border-slate-800"
+                        >
+                          API Keys ({u.api_keys?.length || 0})
+                        </button>
+                        {!isSelf && (
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteUser(u)}
+                            className="p-1 rounded bg-rose-500/15 hover:bg-rose-500/25 text-rose-300 border border-rose-500/30"
+                            title={`Delete ${u.username}`}
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    {showReset && (
+                      <div className="pt-2 border-t border-slate-800/80 flex items-center gap-2">
+                        <input
+                          type="password"
+                          minLength={6}
+                          value={resetPasswordVal}
+                          onChange={(e) => setResetPasswordVal(e.target.value)}
+                          placeholder={`New password for ${u.username} (min 6 chars)`}
+                          className="flex-1 px-2.5 py-1 rounded bg-slate-900 border border-slate-800 text-slate-100"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => handleResetUserPassword(u)}
+                          className="px-3 py-1 rounded font-semibold bg-amber-500 text-slate-950"
+                        >
+                          Save Password
+                        </button>
+                      </div>
+                    )}
+
+                    {showKeys && (
+                      <div className="pt-2 border-t border-slate-800/80 space-y-2">
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="text"
+                            value={newKeyName}
+                            onChange={(e) => setNewKeyName(e.target.value)}
+                            placeholder="New key label (e.g. Reporting Script)"
+                            className="flex-1 px-2.5 py-1 rounded bg-slate-900 border border-slate-800 text-slate-100"
+                          />
+                          <select
+                            value={newKeyDays}
+                            onChange={(e) => setNewKeyDays(e.target.value)}
+                            className="px-2 py-1 rounded bg-slate-900 border border-slate-800 text-slate-200"
+                          >
+                            <option value="">No Expiry</option>
+                            <option value="30">30 days</option>
+                            <option value="90">90 days</option>
+                            <option value="365">365 days</option>
+                          </select>
+                          <button
+                            type="button"
+                            onClick={() => handleCreateUserKey(u)}
+                            className="px-2.5 py-1 rounded font-semibold bg-sky-500 text-slate-950"
+                          >
+                            + Issue Key
+                          </button>
+                        </div>
+
+                        {u.api_keys && u.api_keys.length > 0 ? (
+                          <div className="space-y-1">
+                            {u.api_keys.map((k) => (
+                              <div
+                                key={k.id}
+                                className="px-2.5 py-1.5 rounded bg-slate-900/90 border border-slate-800 flex items-center justify-between"
+                              >
+                                <div>
+                                  <span className="font-medium text-slate-200">
+                                    {k.name}
+                                  </span>{" "}
+                                  <span className="font-mono text-[10px] text-sky-300 ml-1">
+                                    ({k.key_prefix}...)
+                                  </span>
+                                  <span className="text-[10px] text-slate-400 ml-2">
+                                    {k.expires_at
+                                      ? `Expires ${formatTimestamp(k.expires_at)}`
+                                      : "No expiry"}
+                                  </span>
+                                </div>
+                                <button
+                                  type="button"
+                                  onClick={() => handleRevokeUserKey(u, k.id)}
+                                  className="text-[11px] text-rose-300 hover:underline"
+                                >
+                                  Revoke
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="text-[11px] text-slate-500">
+                            No API keys issued for this user.
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </div>
+      </div>
     </div>
   );
 }

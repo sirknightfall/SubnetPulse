@@ -15,31 +15,32 @@ docker compose up -d --build
 
 ---
 
-## Authentication & Authorization
+## Authentication, Role-Based Access & User Management
 
-All inventory, reporting, CRUD, bulk-import, and scan-control endpoints require authentication (`Bearer` session token, `X-API-Key` header, HTTP Basic credentials, or session cookie).
+All inventory, reporting, CRUD, bulk-import, and scan-control endpoints require authentication (`Bearer` session token, `X-API-Key` header, HTTP Basic credentials, or `HttpOnly` session cookie).
 
-### Default Credentials (configurable via `.env` or [docker-compose.yml](file:///home/lordknightfall/gemini/SubnetPulse/docker-compose.yml))
+### Initial Seeded Credentials (configurable via `.env` or [docker-compose.yml](file:///home/lordknightfall/gemini/SubnetPulse/docker-compose.yml))
 
-| Role | Username | Password | API Key (`X-API-Key`) | Permissions |
+On first boot, SubnetPulse seeds the initial administrator and auditor accounts into SQLite with salted PBKDF2-HMAC-SHA256 password hashes (`260,000` iterations) and SHA-256 API key digests:
+
+| Role | Username | Password | Initial API Key (`X-API-Key`) | Permissions |
 | :--- | :--- | :--- | :--- | :--- |
-| **Admin** | `admin` | `subnetpulse-admin` | `sp-admin-secret-key-2026` | Full CRUD, bulk import, manual scans, history reset, IP audit updates |
+| **Admin** | `admin` | `subnetpulse-admin` | `sp-admin-secret-key-2026` | Full CRUD, bulk import, manual scans, history reset, IP audit updates, user & API key management |
 | **Viewer** | `auditor` | `subnetpulse-viewer` | `sp-viewer-readonly-key-2026` | Read-only access to sites, subnets, IP inventory, audit logs, and CSV/JSON exports |
 
 ---
 
-## Future Roadmap / Planned Features
+## User & Security Features
 
 ### 1. Database-Backed Multi-User Management
-- Add a `User` table in SQLite (`id`, `username`, `password_hash`, `role`, `is_active`, `created_at`, `last_login_at`) using salted password hashing (PBKDF2/Argon2/bcrypt).
-- Seed the initial administrator account from `ADMIN_USERNAME` / `ADMIN_PASSWORD` on first boot while persisting subsequent user accounts in SQLite.
-- Expose admin-only user management endpoints (`GET /api/users`, `POST /api/users`, `PATCH /api/users/{id}`, `DELETE /api/users/{id}`) to create, disable, role-switch (`admin` / `viewer`), or remove accounts.
-- Add an **Admin User Management Modal** in the React console so administrators can add/remove users and assign roles directly from the UI.
+- **SQLite `User` Store:** Stores operator accounts (`id`, `username`, `password_hash`, `role`, `is_active`, `created_at`, `last_login_at`) in [models.py](file:///home/lordknightfall/gemini/SubnetPulse/backend/models.py).
+- **Admin Endpoints:** `GET /api/users`, `POST /api/users`, `PATCH /api/users/{id}`, and `DELETE /api/users/{id}` in [main.py](file:///home/lordknightfall/gemini/SubnetPulse/backend/main.py) with self-lockout safeguards (preventing deletion, deactivation, or demotion of the last active administrator).
+- **Admin UI Modal:** Accessible via the **Users** button in the top navigation bar ([App.jsx](file:///home/lordknightfall/gemini/SubnetPulse/frontend/src/App.jsx)) for creating accounts, switching `admin` / `viewer` roles, disabling accounts, resetting passwords, and issuing/revoking per-user API keys.
 
 ### 2. Self-Service Password Rotation
-- Add `POST /api/auth/change-password` allowing any authenticated user to verify their current password and set a new password.
-- Add a **Change Password** modal accessible from the top navigation bar next to the user badge.
+- **Endpoint:** `POST /api/auth/change-password` verifies the caller's current password and updates their salted PBKDF2 hash.
+- **UI Modal:** Accessible to any authenticated operator via the **Password & Keys** button in the top navigation bar.
 
 ### 3. Per-User Scoped API Keys & Actor Attribution
-- Allow generating and revoking named API keys per user with optional expiration dates.
-- Record the acting `username` on `AuditEventLog` entries (`MANUAL_AUDIT_UPDATE`, manual scan triggers, and history resets) for full operator accountability.
+- **Scoped API Keys (`UserAPIKey`):** Operators and administrators can generate and revoke named API keys (`sp_live_...`) with optional expiration windows (`GET /api/auth/api-keys`, `POST /api/auth/api-keys`, `DELETE /api/auth/api-keys/{key_id}`, and `/api/users/{user_id}/api-keys`). Only the SHA-256 hash and key prefix are stored in SQLite.
+- **Operator Accountability (`actor_username`):** `AuditEventLog` entries record the acting operator's `username` across manual IP audit updates (`MANUAL_AUDIT_UPDATE`), manual subnet scan triggers (`MANUAL_SCAN_TRIGGER`), and subnet history resets (`HISTORY_RESET`), displayed as `by <username>` badges in the IP Audit History modal.

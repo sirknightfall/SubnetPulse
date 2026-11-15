@@ -117,6 +117,46 @@ export const api = {
     }
   },
   getMe: () => request("/auth/me"),
+  changePassword: (payload) =>
+    request("/auth/change-password", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  getMyApiKeys: () => request("/auth/api-keys"),
+  createMyApiKey: (payload) =>
+    request("/auth/api-keys", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  revokeMyApiKey: (keyId) =>
+    request(`/auth/api-keys/${keyId}`, {
+      method: "DELETE"
+    }),
+  getUsers: () => request("/users"),
+  createUser: (payload) =>
+    request("/users", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  updateUser: (userId, payload) =>
+    request(`/users/${userId}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload)
+    }),
+  deleteUser: (userId) =>
+    request(`/users/${userId}`, {
+      method: "DELETE"
+    }),
+  getUserApiKeys: (userId) => request(`/users/${userId}/api-keys`),
+  createUserApiKey: (userId, payload) =>
+    request(`/users/${userId}/api-keys`, {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  revokeUserApiKey: (userId, keyId) =>
+    request(`/users/${userId}/api-keys/${keyId}`, {
+      method: "DELETE"
+    }),
   getTree: () => request("/tree"),
   createSite: (payload) =>
     request("/sites", {

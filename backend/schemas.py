@@ -5,7 +5,7 @@ from typing import List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 
-from models import AuditFlag, IPStatus, ScanStatus
+from models import AuditFlag, IPStatus, ScanStatus, UserRole
 
 
 def cidrs_overlap(cidr_a: str, cidr_b: str) -> bool:
@@ -18,7 +18,7 @@ def cidrs_overlap(cidr_a: str, cidr_b: str) -> bool:
 
 
 # ==========================================
-# Authentication & Authorization Schemas
+# Authentication, User & API Key Schemas
 # ==========================================
 class LoginRequest(BaseModel):
     username: Optional[str] = Field(default=None, max_length=120)
@@ -29,15 +29,106 @@ class LoginRequest(BaseModel):
 class AuthTokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
+    user_id: Optional[int] = None
     username: str
     role: str
     expires_in: int
 
 
 class AuthUserRead(BaseModel):
+    user_id: Optional[int] = None
     username: str
     role: str
     authenticated: bool = True
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(..., min_length=1, max_length=255)
+    new_password: str = Field(..., min_length=6, max_length=255)
+
+    @field_validator("new_password")
+    @classmethod
+    def validate_new_password(cls, value: str) -> str:
+        if len(value.strip()) < 6:
+            raise ValueError("New password must be at least 6 characters long.")
+        return value
+
+
+class UserAPIKeyCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120, examples=["NetOps CI/CD Key"])
+    expires_in_days: Optional[int] = Field(
+        default=None, ge=1, le=3650, description="Optional expiration window in days"
+    )
+    expires_at: Optional[datetime] = Field(
+        default=None, description="Optional explicit UTC expiration timestamp"
+    )
+
+    @field_validator("name")
+    @classmethod
+    def validate_key_name(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("API key name cannot be empty.")
+        return cleaned
+
+
+class UserAPIKeyRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    user_id: int
+    name: str
+    key_prefix: str
+    is_active: bool
+    expires_at: Optional[datetime] = None
+    last_used_at: Optional[datetime] = None
+    created_at: datetime
+
+
+class UserAPIKeyCreatedResponse(UserAPIKeyRead):
+    api_key: str
+
+
+class UserCreate(BaseModel):
+    username: str = Field(..., min_length=2, max_length=120)
+    password: str = Field(..., min_length=6, max_length=255)
+    role: UserRole = UserRole.VIEWER
+    is_active: bool = True
+
+    @field_validator("username")
+    @classmethod
+    def validate_username(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not re.match(r"^[A-Za-z0-9_.\-@]+$", cleaned):
+            raise ValueError(
+                "Username may only contain letters, numbers, underscores, hyphens, dots, or @."
+            )
+        return cleaned
+
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, value: str) -> str:
+        if len(value.strip()) < 6:
+            raise ValueError("Password must be at least 6 characters long.")
+        return value
+
+
+class UserUpdate(BaseModel):
+    role: Optional[UserRole] = None
+    is_active: Optional[bool] = None
+    password: Optional[str] = Field(default=None, min_length=6, max_length=255)
+
+
+class UserRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    username: str
+    role: UserRole
+    is_active: bool
+    created_at: datetime
+    last_login_at: Optional[datetime] = None
+    api_keys: List[UserAPIKeyRead] = []
 
 
 # ==========================================
@@ -51,6 +142,7 @@ class AuditEventLogRead(BaseModel):
     previous_status: Optional[IPStatus] = None
     new_status: Optional[IPStatus] = None
     event_type: str
+    actor_username: Optional[str] = None
     response_time_ms: Optional[float] = None
     details: Optional[str] = None
     timestamp: datetime
